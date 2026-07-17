@@ -1,0 +1,18 @@
+name: pllm
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --no-cache-dir
+      - vllm==0.25.1
+      - fastsafetensors==0.3.3
+      - Flask>=3.1,<4
+      - requests>=2.32,<3
+      - psutil>=7,<8
+      - nvidia-ml-py>=13,<14
+      - PySide6>=6.8,<7
+      - dbus-next>=0.2.3,<1
+      - pytest>=8,<10
+      - pytest-cov>=6,<8

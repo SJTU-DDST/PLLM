@@ -1,0 +1,161 @@
+# PLLM HiberFlow-EER
+
+PLLM HiberFlow-EER 是面向 DGX Spark 与 NVIDIA 桌面 AI 工作站的前台感知 vLLM 资源运行时。它在 Blender、游戏、视频编码或系统内存压力出现时，按前台资源包络在完整驻留、精确的弹性专家驻留、微暂停和事务式深度休眠间选择。
+
+第一版只控制 vLLM。PLLM 不暂停或终止训练任务、未知 CUDA 进程，也不会控制未开放 Sleep API 的外部服务。
+
+当前已实现 Foreground-QoS、暂停恢复、route-history/conformal planner，以及 vLLM 0.25.1 ModelOpt NVFP4/Marlin 专家数据面：checksummed SSD runtime objects、actual Top-22 blocking load、physical slot resize 和 host-staged RC RDMA get/put。由于 GPU 正被其他实验占用，新数据面尚未编译或运行；真实 route tracer、Mamba transaction 与 Nemotron 性能实验仍待完成。
+
+![PLLM Web control center](results/pllm-dashboard-eer-desktop.png)
+
+## 核心贡献
+
+- **Foreground-QoS Agent**：每 250ms 融合 GNOME 焦点、NVML 进程级 SM/NVENC/NVDEC、显存、功耗、PSI、`MemAvailable` 与供电状态；经本机校准的成本函数在 `yield` 和 `hibernate` 间选择，并公开每项代价。
+- **Exact Elastic Expert Residency**：保持 Nemotron 原始 Top-22 路由，只动态收缩 routed-expert physical slots；预测 miss 必须加载正确 expert。DGX Spark 上冷 experts 位于 NVMe 或远端主机，不把 CPU pages 误当成独立容量层。
+- **HiberCache**：使用 vLLM `OffloadingConnector + TieringOffloadingSpec`，以 512MiB host staging 和 `/mnt/ssd-storage/pllm-cache` 文件层保存可复用 KV block。vLLM 0.25.1 版本守卫补丁在深度 `mode=keep` 时保留 connector cache；缺失的混合模型状态由 token 重算恢复。
+- **SparkLoad**：Level 2 不重复写出约 75GB 不可变权重；直接从共享模型目录使用 `fastsafetensors` 恢复。GB10 选择 unified copier，独显可选择 GDS。
+- **DGX Spark RDMA fallback**：能力探测禁止在 GB10 上声明 GPUDirect RDMA。C++20 RC QP store 实际传输 checksummed expert objects，支持 get/put、remote commit ACK 和 token-file；当前独立进程路径先填充本地 SSD cache，再复制到 CUDA/UMA slot。
+- **事务式 live-state carrier**：KV/Mamba/sampler/ledger bytes 按 64MiB 分块，SSD directory 与远端 manifest 均最后提交；当前 serializer 尚未接入 vLLM/NemotronH，状态明确为 carrier implemented / exact resume pending。
+
+## 状态机
+
+```text
+FULL_RESIDENT <-> ELASTIC_RESIDENT -> YIELDING -> HIBERNATED -> RESTORING
+```
+
+- `YIELDING`：vLLM Level 0、`mode=keep`，scheduler 停在 token 边界，HTTP 流保持连接，GPU cache 保留。
+- `HIBERNATED`：Level 1/2、`mode=keep`。独显且主存宽裕时可用 Level 1；DGX Spark UMA、游戏、低电量或内存压力使用 Level 2。
+- `RESTORING`：Level 2 依次恢复 weights、执行 `reload_weights`、恢复 KV cache，再开放 scheduler。
+- `abort` 只用于错误恢复，不是默认抢占路径。
+
+## 环境
+
+环境固定为 Python 3.12 conda，不使用 uv：
+
+```bash
+cd ~/PLLM
+bash scripts/setup_conda.sh
+conda activate pllm
+```
+
+当前验收版本：vLLM 0.25.1、Torch 2.11、fastsafetensors 0.3.3、PySide6 6.11。模型只读复用，不下载、不复制：
+
+```text
+/mnt/ssd-storage/shared_models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+```
+
+为 HiberCache 创建专用目录：
+
+```bash
+sudo install -d -m 0750 -o "$USER" -g "$(id -gn)" /mnt/ssd-storage/pllm-cache
+sudo install -d -m 0750 -o "$USER" -g "$(id -gn)" /mnt/ssd-storage/pllm-experts
+```
+
+## 无 GPU 演示
+
+当前 GPU 忙碌时使用 mock 验证完整控制面：
+
+```bash
+conda activate pllm
+python scripts/mock_vllm.py --port 18000
+PLLM_CONFIG=$PWD/tests/fixtures/integration-config.toml python -m pllm.daemon
+```
+
+打开 [http://127.0.0.1:17861](http://127.0.0.1:17861)。控制中心为 Flask 静态托管的 Vue 3 应用，不含 Node.js 构建链；“评委模式”中的回放数据始终显示为历史回放。
+
+悬浮窗：
+
+```bash
+python -m pllm.desktop --api-base http://127.0.0.1:17861
+```
+
+## 真实模型
+
+仅在 GPU 空闲后运行：
+
+```bash
+bash scripts/run_vllm.sh
+bash scripts/run_daemon.sh
+bash scripts/run_desktop.sh
+```
+
+`run_vllm.sh` 使用 NVFP4 + Marlin、FP8 KV、32K context、最多 2 个请求、85% GPU 内存上限、HiberCache 与 fastsafetensors。模型端口只绑定 `127.0.0.1`；vLLM 的开发控制端点不得暴露到局域网。
+
+OpenAI 客户端应指向 PLLM 代理：
+
+```text
+http://127.0.0.1:17860/v1
+```
+
+### Elastic Expert 数据面
+
+仅在 GPU 空闲后首次导出 Marlin runtime experts：
+
+```bash
+bash scripts/run_vllm_export_experts.sh
+python scripts/eer_runtime_ctl.py status
+```
+
+确认 `runtime-manifest.json` 包含 20,480 objects 后：
+
+```bash
+PLLM_EER_SLOTS_PER_LAYER=128 bash scripts/run_vllm_eer.sh
+```
+
+该路径强制 vLLM 0.25.1、ModelOpt NVFP4、Marlin modular backend、lazy safetensors 与 eager execution。首次导出额外占用约 routed runtime weight 规模的 SSD；准确大小以实际导出为准。
+
+## RDMA 微基准
+
+```bash
+cmake -S rdma_bridge -B rdma_bridge/build -DCMAKE_BUILD_TYPE=Release
+cmake --build rdma_bridge/build -j
+python scripts/rdma_benchmark.py --allocator aligned --device mlx5_0
+```
+
+双机测试在对端先运行 `python scripts/rdma_benchmark.py --server`，本机再加 `--peer <IP>`。输出将 host staging 与网络 RDMA write 分开写入 `results/rdma_bench.json`。
+
+## API
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/v1/status` | 状态机、传感器、成本决策 |
+| GET | `/api/v1/capabilities` | UMA、loader、HiberCache、RDMA 能力 |
+| GET | `/api/v1/telemetry/stream` | SSE 实时遥测 |
+| GET | `/api/v1/vllm` | 服务发现与可控性 |
+| GET | `/api/v1/events` | 决策与恢复记录 |
+| GET | `/api/v1/replays` | 请求、token 位置与恢复状态 |
+| GET | `/api/v1/experiments` | 实验指标 |
+| GET | `/api/v1/expert-residency` | Expert catalog、当前投影与证据边界 |
+| GET | `/api/v1/expert-dataplane` | vLLM 进程内 slot/SSD/RDMA 实时状态 |
+| PUT | `/api/v1/policy` | 更新模式与阈值 |
+| POST | `/api/v1/policy/compile` | 自然语言偏好编译为受限规则 |
+| POST | `/api/v1/actions` | `yield`、`hibernate`、`wake`、`benchmark` |
+| POST | `/api/v1/expert-residency/plan` | 计算资源包络建议，不修改 vLLM 权重 |
+| POST | `/api/v1/expert-dataplane/actions` | `resize`、`prefetch`、`evict`、`evict_all` |
+| POST | `/v1/chat/completions` | OpenAI 兼容代理 |
+
+## 已验证边界
+
+```bash
+pytest
+```
+
+- 数据面修改前最后一次回归为 39 项通过。此后新增的数据面及 deferred tests 按要求尚未运行，不能沿用该结果作为新代码证据。
+- C++ bridge 在当前 `mlx5_0` 真实完成 PD/MR 注册；16MiB aligned staging 测得 131.204Gb/s host copy、443.205us MR 注册。该值不是网络 RDMA 带宽。
+- 桌面 1440×1800、移动 390×2800 和 PySide6 370×535 截图通过。
+- 20 秒稳态守护进程采样为 0.80% CPU、67MiB RSS；GPU 快采样周期仍为 250ms。
+- 真实 Nemotron Level 2 释放量、恢复时间、TTFT 与前台吞吐尚未运行，不能用 mock 指标替代。
+
+## 文档
+
+- [项目报告](docs/PLLM项目报告.md)
+- [最新论文设计稿](paper/HiberFlow-ACM四页稿.md)
+- [四轮审稿与答辩记录](docs/reviews/四轮审稿迭代记录.md)
+- [三轮工程与九轮专项审稿总览](docs/reviews/三轮项目迭代总览.md)
+- [暂停恢复调研](docs/主流推理框架暂停恢复调研.md)
+- [部署说明](docs/部署说明.md)
+- [实验报告](docs/实验报告.md)
+- [数据面实现与待验收说明](docs/数据面实现与待验收说明.md)
+- [数据面三轮审稿与答辩](docs/reviews/dataplane-implementation/round-1-review.md)
+- [演示视频脚本](docs/演示视频脚本.md)
+- [黑客松十日谈](docs/十日谈.md)

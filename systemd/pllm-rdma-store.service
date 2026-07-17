@@ -1,0 +1,14 @@
+[Unit]
+Description=PLLM remote runtime-expert RDMA store
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT_DIR@
+ExecStart=@ROOT_DIR@/rdma_bridge/build/pllm-rdma-store --server /mnt/ssd-storage/pllm-experts --port 17900 --allocator cuda-host --token-file @HOME@/.config/pllm/rdma-token
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,24 @@
+[pllm]
+api_host = "127.0.0.1"
+api_port = 17861
+poll_interval_seconds = 0.25
+service_refresh_seconds = 1.0
+request_timeout_seconds = 2.0
+mode = "auto"
+default_vllm_urls = ["http://127.0.0.1:18000"]
+model_path = "/mnt/ssd-storage/shared_models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+creative_hold_seconds = 0.5
+resume_idle_seconds = 2.0
+wake_cooldown_seconds = 60.0
+external_gpu_pressure_percent = 70
+creative_gpu_percent = 15
+idle_gpu_percent = 10
+min_free_vram_gb = 8.0
+min_available_memory_gb = 20.0
+hot_sleep_memory_reserve_gb = 16.0
+low_battery_percent = 40.0
+dry_run = false
+foreground_file = ""
+game_patterns = ["steam_app_", "proton", "wine", "gamescope"]
+creative_patterns = ["blender", "davinci", "resolve", "obs", "ffmpeg"]
+excluded_process_patterns = ["train", "trainer", "grpo", "deepspeed", "torchrun"]

@@ -1,0 +1,8 @@
+{
+  "uuid": "pllm-foreground@local",
+  "name": "PLLM Foreground Bridge",
+  "description": "Reports the active GNOME window to the local PLLM daemon",
+  "shell-version": ["42"],
+  "version": 1
+}
+

@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111513" />
+    <title>PLLM HiberFlow-EER</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div id="app" v-cloak>
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <h1>PLLM <strong>HiberFlow-EER</strong></h1>
+            <p>Foreground-aware elastic MoE inference</p>
+          </div>
+        </div>
+
+        <div class="state-chip" :class="stateClass">
+          <span class="pulse"></span>
+          <span>{{ stateLabel }}</span>
+          <small>{{ activeStatus.pause_mode || 'keep' }} · L{{ activeStatus.sleep_level ?? 0 }}</small>
+        </div>
+
+        <div class="header-actions">
+          <div class="live-switch" role="group" aria-label="数据模式">
+            <button :class="{ active: !judgeMode }" @click="setJudgeMode(false)">实时</button>
+            <button :class="{ active: judgeMode }" @click="setJudgeMode(true)">评委模式</button>
+          </div>
+          <button class="icon-button" title="刷新能力探测" @click="loadCapabilities(true)">
+            <i data-lucide="refresh-cw"></i>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section class="command-band">
+          <div class="command-copy">
+            <span class="eyebrow">{{ dataModeLabel }}</span>
+            <h2>{{ headline }}</h2>
+            <p>{{ activeStatus.reason || '系统正在评估前台 QoS、释放收益与恢复成本。' }}</p>
+          </div>
+          <div class="command-actions">
+            <button class="action secondary" @click="runAction('yield')" :disabled="busy || (!backendAvailable && !judgeMode)">
+              <i data-lucide="pause"></i><span>微暂停</span>
+            </button>
+            <button class="action danger" @click="runAction('hibernate')" :disabled="busy || (!backendAvailable && !judgeMode)">
+              <i data-lucide="snowflake"></i><span>释放资源</span>
+            </button>
+            <button class="action primary" @click="runAction('wake')" :disabled="busy || (!backendAvailable && !judgeMode)">
+              <i data-lucide="play"></i><span>恢复推理</span>
+            </button>
+            <button v-if="judgeMode" class="action judge" @click="playJudgeDemo" :disabled="demoPlaying">
+              <i data-lucide="presentation"></i><span>{{ demoPlaying ? '演示进行中' : '运行演示' }}</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="telemetry-strip">
+          <div class="metric">
+            <span>前台任务</span>
+            <strong>{{ foregroundName }}</strong>
+            <small>{{ activeStatus.workload || 'idle' }}</small>
+          </div>
+          <div class="metric">
+            <span>GPU</span>
+            <strong>{{ metric(sensor.gpu_util, '%') }}</strong>
+            <small>{{ sensor.gpu_name || 'NVML unavailable' }}</small>
+          </div>
+          <div class="metric">
+            <span>{{ sensor.uma ? 'UMA 可用' : '显存占用' }}</span>
+            <strong>{{ memoryMetric }}</strong>
+            <small>{{ sensor.uma ? 'MemAvailable' : 'device memory' }}</small>
+          </div>
+          <div class="metric">
+            <span>GPU 功耗</span>
+            <strong>{{ metric(sensor.power_watts, ' W', 1) }}</strong>
+            <small>{{ sensor.on_battery ? '电池供电' : (sensor.power_profile || 'unknown') }}</small>
+          </div>
+          <div class="metric accent">
+            <span>已释放</span>
+            <strong>{{ metric(activeStatus.reclaimed_gb, ' GiB', 1) }}</strong>
+            <small>{{ durationText }}</small>
+          </div>
+        </section>
+
+        <section class="memory-section">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">SPARKLOAD DATA PATH</span>
+              <h3>GPU / UMA / NVMe / RDMA 四级内存流</h3>
+            </div>
+            <div class="legend"><span class="dot live"></span>实时路径 <span class="dot candidate"></span>候选路径</div>
+          </div>
+
+          <div class="tier-flow">
+            <template v-for="(tier, index) in tiers" :key="tier.name">
+              <article class="tier" :class="{ selected: tier.selected, unavailable: !tier.available }">
+                <div class="tier-icon"><i :data-lucide="tier.icon"></i></div>
+                <div>
+                  <span>{{ tier.role }}</span>
+                  <h4>{{ tier.name }}</h4>
+                  <p>{{ tier.detail }}</p>
+                </div>
+                <strong>{{ tier.value }}</strong>
+              </article>
+              <div v-if="index < tiers.length - 1" class="flow-link" :class="{ active: tier.linkActive }">
+                <span></span><i data-lucide="chevron-right"></i>
+              </div>
+            </template>
+          </div>
+
+          <div class="transition-progress">
+            <span :style="{ width: transitionProgress + '%' }"></span>
+          </div>
+        </section>
+
+        <section class="expert-section">
+          <div class="section-heading expert-heading">
+            <div>
+              <span class="eyebrow">EXACT ELASTIC EXPERT RESIDENCY</span>
+              <h3>Nemotron Top-22 专家工作集</h3>
+            </div>
+            <div class="expert-controls">
+              <span class="evidence-badge" :class="{ pending: !expertResidency.data_plane_ready }">{{ expertEvidenceLabel }}</span>
+              <div class="preset-switch" role="group" aria-label="资源包络">
+                <button :class="{ active: expertPreset === 'idle' }" @click="planExpertPreset('idle')">空闲</button>
+                <button :class="{ active: expertPreset === 'creative' }" @click="planExpertPreset('creative')">创作</button>
+                <button :class="{ active: expertPreset === 'emergency' }" @click="planExpertPreset('emergency')">紧急</button>
+              </div>
+            </div>
+          </div>
+          <div class="expert-metrics">
+            <div><span>每层 Slots</span><strong>{{ expertPlan.slots_per_layer ?? '--' }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
+            <div><span>投影驻留</span><strong>{{ metric(expertPlan.projected_resident_gib, ' GiB', 1) }}</strong></div>
+            <div><span>投影释放</span><strong>{{ metric(expertPlan.projected_reclaim_gib, ' GiB', 1) }}</strong></div>
+            <div><span>预计 Miss 流量</span><strong>{{ metric(expertPlan.estimated_miss_gib_s, ' GiB/s', 2) }}</strong></div>
+            <div><span>Token Rate Cap</span><strong>{{ metric(expertPlan.token_rate_limit, ' tok/s', 2) }}</strong></div>
+          </div>
+          <div class="expert-layer-grid" :class="`plan-${expertPlan.action || 'unknown'}`">
+            <div v-for="layer in expertLayerCells" :key="layer.index" :title="`MoE layer ${layer.index}: ${layer.slots} slots`">
+              <i :style="{ height: layer.fill + '%' }"></i><span>{{ layer.index }}</span>
+            </div>
+          </div>
+          <div class="expert-plan-line">
+            <i data-lucide="route"></i>
+            <strong>{{ expertPlan.action || 'awaiting_plan' }}</strong>
+            <span>{{ expertPlan.reason || expertResidency.guardrail || 'recommendation_only_no_vllm_weight_mutation' }}</span>
+            <em>Top-k {{ expertModel.top_k || 22 }} · {{ expertPlan.executable ? 'EXECUTABLE' : 'NOT EXECUTABLE' }}</em>
+            <button class="apply-expert" :disabled="!expertPlan.executable || expertActionBusy" @click="applyExpertPlan" title="应用物理专家槽位">
+              <i data-lucide="refresh-cw"></i><span>{{ expertActionBusy ? '切换中' : '应用槽位' }}</span>
+            </button>
+          </div>
+          <div class="expert-data-line" :class="{ live: expertDataPlane.data_plane_ready }">
+            <span><i data-lucide="hard-drive"></i> SSD {{ expertDataPlane.cache?.objects ?? 0 }} objects</span>
+            <span><i data-lucide="network"></i> RDMA {{ expertDataPlane.rdma?.enabled ? expertDataPlane.rdma.peer : 'local fallback' }}</span>
+            <span><i data-lucide="layers-3"></i> {{ expertDataPlane.data_plane?.layers?.length ?? 0 }} live layers</span>
+          </div>
+        </section>
+
+        <section class="workspace-grid">
+          <section class="panel utilization-panel">
+            <div class="panel-title">
+              <div><span class="eyebrow">RESOURCE TRACE</span><h3>前台性能与系统压力</h3></div>
+              <span class="sample-count">{{ samples.length }} samples</span>
+            </div>
+            <div class="chart-wrap">
+              <svg viewBox="0 0 720 220" preserveAspectRatio="none" role="img" aria-label="GPU 和内存压力曲线">
+                <g class="grid-lines"><line v-for="y in [20,70,120,170]" :key="y" x1="0" :y1="y" x2="720" :y2="y" /></g>
+                <polyline class="line gpu" :points="linePoints('gpu')" />
+                <polyline class="line memory" :points="linePoints('memory')" />
+                <line v-if="judgeMode" class="event-marker" :x1="eventMarker" y1="0" :x2="eventMarker" y2="220" />
+              </svg>
+              <div class="chart-key"><span class="gpu-key">GPU</span><span class="memory-key">内存压力</span></div>
+            </div>
+          </section>
+
+          <section class="panel decision-panel">
+            <div class="panel-title">
+              <div><span class="eyebrow">FOREGROUND-QOS AGENT</span><h3>本次决策</h3></div>
+              <span class="score">score {{ decisionScore }}</span>
+            </div>
+            <div class="decision-reason">
+              <i data-lucide="git-branch"></i>
+              <p>{{ decisionReason }}</p>
+            </div>
+            <div class="cost-list">
+              <div v-for="row in costRows" :key="row.name" class="cost-row">
+                <span>{{ row.label }}</span>
+                <div><i :style="{ width: row.width + '%' }"></i></div>
+                <strong>{{ row.value }}</strong>
+              </div>
+            </div>
+            <div class="guardrail"><i data-lucide="shield-check"></i><span>规则护栏：不终止训练或未知 CUDA 进程</span></div>
+          </section>
+        </section>
+
+        <section class="workspace-grid lower-grid">
+          <section class="panel state-panel">
+            <div class="panel-title">
+              <div><span class="eyebrow">LOSSLESS LIFECYCLE</span><h3>请求连续性</h3></div>
+              <span>{{ activeReplays.length }} requests</span>
+            </div>
+            <div class="state-track">
+              <div v-for="(state, index) in lifecycle" :key="state.id" :class="{ active: state.active, done: state.done }">
+                <span>{{ index + 1 }}</span><strong>{{ state.label }}</strong><small>{{ state.detail }}</small>
+              </div>
+            </div>
+            <div v-if="activeReplays.length" class="request-list">
+              <article v-for="request in activeReplays.slice(0, 3)" :key="request.id">
+                <i data-lucide="message-square-code"></i>
+                <div><strong>{{ requestTitle(request) }}</strong><small>{{ replayState(request) }}</small></div>
+                <span>token {{ request.paused_at_token || request.generated_tokens || 0 }}</span>
+              </article>
+            </div>
+            <div v-else class="empty-request"><i data-lucide="circle-dashed"></i><span>当前没有生成中的请求</span></div>
+          </section>
+
+          <section class="panel capability-panel">
+            <div class="panel-title">
+              <div><span class="eyebrow">CAPABILITY PROBE</span><h3>恢复能力</h3></div>
+              <span>{{ capabilityReady }}/{{ capabilityRows.length }} ready</span>
+            </div>
+            <div class="capability-list">
+              <div v-for="item in capabilityRows" :key="item.name">
+                <i :data-lucide="item.ready ? 'check-circle-2' : 'circle-alert'" :class="{ ready: item.ready }"></i>
+                <span><strong>{{ item.name }}</strong><small>{{ item.detail }}</small></span>
+                <em>{{ item.ready ? 'READY' : 'FALLBACK' }}</em>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="experiments-band">
+          <div class="section-heading">
+            <div><span class="eyebrow">REPRODUCIBLE EVIDENCE</span><h3>实验与事件</h3></div>
+            <button class="text-button" @click="runAction('benchmark')" :disabled="busy"><i data-lucide="flask-conical"></i>无 GPU 基准</button>
+          </div>
+          <div class="evidence-grid">
+            <div class="experiment-table">
+              <div class="table-head"><span>实验</span><span>路径</span><span>结果</span><span>时间</span></div>
+              <div v-for="item in displayExperiments" :key="item.id" class="table-row">
+                <strong>{{ item.name || item.experiment_type }}</strong><span>{{ item.variant || item.label }}</span><span>{{ experimentResult(item) }}</span><time>{{ shortTime(item.created_at) }}</time>
+              </div>
+              <div v-if="!displayExperiments.length" class="table-empty">尚无本机实验记录</div>
+            </div>
+            <div class="event-feed">
+              <div v-for="item in displayEvents.slice(0, 5)" :key="item.id || item.created_at">
+                <span :class="eventTone(item.event_type)"></span>
+                <p><strong>{{ eventName(item.event_type) }}</strong>{{ item.reason }}</p>
+                <time>{{ shortTime(item.created_at) }}</time>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="policy-band">
+          <div><span class="eyebrow">POLICY COMPILER</span><h3>自然语言偏好 → 受限策略</h3></div>
+          <input v-model="policyText" @keyup.enter="compilePolicy" aria-label="策略描述" />
+          <button class="action secondary" @click="compilePolicy" :disabled="busy"><i data-lucide="wand-sparkles"></i><span>编译</span></button>
+          <p v-if="compiledPolicy">{{ compiledPolicy }}</p>
+        </section>
+      </main>
+
+      <div v-if="toast" class="toast" :class="toast.tone">{{ toast.text }}</div>
+    </div>
+    <script src="/assets/vendor/vue.global.prod.js"></script>
+    <script src="/assets/vendor/lucide.min.js"></script>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

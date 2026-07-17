@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from enum import StrEnum
+from typing import Any, Protocol
+
+from .expert_store import ExpertPayload, ExpertSource
+
+
+class SlotState(StrEnum):
+    EMPTY = "empty"
+    LOADING = "loading"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class SlotSink(Protocol):
+    slot_count: int
+    required_format: str
+
+    def write(self, slot: int, payload: ExpertPayload) -> None: ...
+
+    def invalidate(self, slot: int) -> None: ...
+
+    def publish_mapping(self, mapping: dict[int, int], generation: int) -> None: ...
+
+    def begin_resize(self, slot_count: int) -> None: ...
+
+    def finish_resize(self) -> None: ...
+
+
+@dataclass(slots=True)
+class SlotRecord:
+    slot: int
+    state: SlotState = SlotState.EMPTY
+    logical_expert: int | None = None
+    generation: int = 0
+    last_used_at: float = 0.0
+    loads: int = 0
+    error: str = ""
+
+
+@dataclass(slots=True)
+class LayerCounters:
+    hits: int = 0
+    misses: int = 0
+    prefetches: int = 0
+    evictions: int = 0
+    bytes_loaded: int = 0
+    load_time_ns: int = 0
+    resize_count: int = 0
+
+
+@dataclass(slots=True)
+class LayerSlotState:
+    layer: int
+    global_experts: int
+    sink: SlotSink
+    slots: list[SlotRecord]
+    logical_to_slot: dict[int, int] = field(default_factory=dict)
+    generation: int = 0
+    counters: LayerCounters = field(default_factory=LayerCounters)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+class ExpertSlotDataPlane:
+    """Exact expert working-set manager shared by SSD and RDMA sources."""
+
+    def __init__(self, source: ExpertSource) -> None:
+        self.source = source
+        self._layers: dict[int, LayerSlotState] = {}
+        self._lock = threading.RLock()
+
+    def register_layer(
+        self,
+        layer: int,
+        global_experts: int,
+        sink: SlotSink,
+        initial_experts: list[int] | None = None,
+    ) -> None:
+        if sink.slot_count <= 0 or sink.slot_count > global_experts:
+            raise ValueError("slot count must be within the logical expert range")
+        with self._lock:
+            if layer in self._layers:
+                raise ValueError(f"layer {layer} is already registered")
+            state = LayerSlotState(
+                layer=layer,
+                global_experts=global_experts,
+                sink=sink,
+                slots=[SlotRecord(slot=index) for index in range(sink.slot_count)],
+            )
+            self._layers[layer] = state
+        if initial_experts:
+            self.ensure(layer, initial_experts, reason="initial")
+        else:
+            sink.publish_mapping({}, 0)
+
+    def unregister_layer(self, layer: int) -> None:
+        with self._lock:
+            state = self._layers.pop(layer, None)
+        if state is None:
+            return
+        with state.lock:
+            state.logical_to_slot.clear()
+            state.generation += 1
+            state.sink.publish_mapping({}, state.generation)
+
+    def ensure(
+        self,
+        layer: int,
+        experts: list[int] | tuple[int, ...] | set[int],
+        reason: str = "route_miss",
+    ) -> dict[int, int]:
+        state = self._layer(layer)
+        requested = list(dict.fromkeys(int(item) for item in experts))
+        if any(item < 0 or item >= state.global_experts for item in requested):
+            raise ValueError(f"layer {layer} received an out-of-range expert ID")
+        if len(requested) > len(state.slots):
+            raise RuntimeError(
+                f"layer {layer} needs {len(requested)} experts but has "
+                f"only {len(state.slots)} physical slots"
+            )
+
+        now = time.monotonic()
+        with state.lock:
+            missing: list[int] = []
+            for expert in requested:
+                slot_index = state.logical_to_slot.get(expert)
+                if slot_index is None:
+                    missing.append(expert)
+                    continue
+                slot = state.slots[slot_index]
+                if slot.state != SlotState.READY:
+                    missing.append(expert)
+                    continue
+                slot.last_used_at = now
+                state.counters.hits += 1
+
+            protected = set(requested)
+            for expert in missing:
+                state.counters.misses += 1
+                if reason == "prefetch":
+                    state.counters.prefetches += 1
+                slot = self._select_slot(state, protected)
+                self._remove_mapping(state, slot)
+                slot.state = SlotState.LOADING
+                slot.logical_expert = expert
+                slot.error = ""
+                state.generation += 1
+                slot.generation = state.generation
+                state.sink.publish_mapping(
+                    dict(state.logical_to_slot), state.generation
+                )
+
+                started = time.perf_counter_ns()
+                try:
+                    payload = self.source.get(layer, expert)
+                    if payload.format != state.sink.required_format:
+                        raise ValueError(
+                            f"slot sink requires {state.sink.required_format}, "
+                            f"found {payload.format}"
+                        )
+                    state.sink.write(slot.slot, payload)
+                except Exception as exc:
+                    slot.state = SlotState.FAILED
+                    slot.error = str(exc)
+                    slot.logical_expert = None
+                    state.sink.invalidate(slot.slot)
+                    state.sink.publish_mapping(
+                        dict(state.logical_to_slot), state.generation
+                    )
+                    raise
+                elapsed = time.perf_counter_ns() - started
+                slot.state = SlotState.READY
+                slot.last_used_at = time.monotonic()
+                slot.loads += 1
+                state.logical_to_slot[expert] = slot.slot
+                state.counters.bytes_loaded += len(payload.data)
+                state.counters.load_time_ns += elapsed
+
+            state.generation += 1
+            state.sink.publish_mapping(dict(state.logical_to_slot), state.generation)
+            return {expert: state.logical_to_slot[expert] for expert in requested}
+
+    def prefetch(self, layer: int, experts: list[int]) -> dict[int, int]:
+        return self.ensure(layer, experts, reason="prefetch")
+
+    def evict(self, layer: int, experts: list[int]) -> int:
+        state = self._layer(layer)
+        evicted = 0
+        with state.lock:
+            for expert in dict.fromkeys(int(item) for item in experts):
+                slot_index = state.logical_to_slot.pop(expert, None)
+                if slot_index is None:
+                    continue
+                slot = state.slots[slot_index]
+                slot.state = SlotState.EMPTY
+                slot.logical_expert = None
+                slot.error = ""
+                state.sink.invalidate(slot.slot)
+                state.counters.evictions += 1
+                evicted += 1
+            if evicted:
+                state.generation += 1
+                state.sink.publish_mapping(
+                    dict(state.logical_to_slot), state.generation
+                )
+        return evicted
+
+    def evict_all(self) -> int:
+        count = 0
+        for layer in self.layers():
+            state = self._layer(layer)
+            count += self.evict(layer, list(state.logical_to_slot))
+        return count
+
+    def resize(
+        self, layer: int, slot_count: int, retain: list[int] | None = None
+    ) -> dict[str, Any]:
+        state = self._layer(layer)
+        if slot_count <= 0 or slot_count > state.global_experts:
+            raise ValueError("slot count must be within the logical expert range")
+        with state.lock:
+            retained = list(
+                dict.fromkeys(
+                    retain
+                    if retain is not None
+                    else sorted(
+                        state.logical_to_slot,
+                        key=lambda item: state.slots[
+                            state.logical_to_slot[item]
+                        ].last_used_at,
+                        reverse=True,
+                    )
+                )
+            )[:slot_count]
+            for expert in retained:
+                if not self.source.contains(layer, expert):
+                    raise FileNotFoundError(
+                        f"cannot resize layer {layer}: backing object {expert} missing"
+                    )
+
+            state.sink.publish_mapping({}, state.generation + 1)
+            state.logical_to_slot.clear()
+            state.sink.begin_resize(slot_count)
+            state.slots = [SlotRecord(slot=index) for index in range(slot_count)]
+            state.generation += 1
+            state.counters.resize_count += 1
+            try:
+                if retained:
+                    self.ensure(layer, retained, reason="resize_restore")
+                state.sink.finish_resize()
+            except Exception:
+                state.sink.publish_mapping({}, state.generation)
+                raise
+            return self.layer_status(layer)
+
+    def layers(self) -> list[int]:
+        with self._lock:
+            return sorted(self._layers)
+
+    def status(self, include_mappings: bool = False) -> dict[str, Any]:
+        return {
+            "backend": "exact_expert_slot_dataplane",
+            "data_plane_ready": bool(self._layers),
+            "exact_route_required": True,
+            "layers": [
+                self.layer_status(layer, include_mapping=include_mappings)
+                for layer in self.layers()
+            ],
+        }
+
+    def layer_status(
+        self, layer: int, include_mapping: bool = True
+    ) -> dict[str, Any]:
+        state = self._layer(layer)
+        with state.lock:
+            ready = sum(slot.state == SlotState.READY for slot in state.slots)
+            failed = sum(slot.state == SlotState.FAILED for slot in state.slots)
+            average_us = (
+                state.counters.load_time_ns / state.counters.misses / 1000
+                if state.counters.misses
+                else 0.0
+            )
+            payload = {
+                "layer": layer,
+                "global_experts": state.global_experts,
+                "slot_count": len(state.slots),
+                "ready_slots": ready,
+                "failed_slots": failed,
+                "generation": state.generation,
+                "counters": {
+                    **asdict(state.counters),
+                    "average_load_us": round(average_us, 3),
+                },
+            }
+            if include_mapping:
+                payload["logical_to_slot"] = dict(state.logical_to_slot)
+            return payload
+
+    def _layer(self, layer: int) -> LayerSlotState:
+        with self._lock:
+            state = self._layers.get(layer)
+        if state is None:
+            raise KeyError(f"layer {layer} is not registered")
+        return state
+
+    @staticmethod
+    def _select_slot(
+        state: LayerSlotState, protected: set[int]
+    ) -> SlotRecord:
+        for slot in state.slots:
+            if slot.state in {SlotState.EMPTY, SlotState.FAILED}:
+                return slot
+        candidates = [
+            slot
+            for slot in state.slots
+            if slot.state == SlotState.READY
+            and slot.logical_expert not in protected
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"layer {state.layer} has no evictable slot for exact routing"
+            )
+        return min(candidates, key=lambda item: item.last_used_at)
+
+    @staticmethod
+    def _remove_mapping(state: LayerSlotState, slot: SlotRecord) -> None:
+        if slot.logical_expert is None:
+            return
+        state.logical_to_slot.pop(slot.logical_expert, None)
+        state.counters.evictions += 1
+        state.sink.invalidate(slot.slot)
+        slot.logical_expert = None
+        slot.state = SlotState.EMPTY

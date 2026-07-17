@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "created_at": 1784221653.8958933,
+  "host_staging": {
+    "transport": "host_staged",
+    "device": "mlx5_0",
+    "link_rate": "100 Gb/sec (4X EDR)",
+    "allocator": "aligned",
+    "bytes": 16777216,
+    "iterations": 32,
+    "mr_registered": true,
+    "registration_us": 443.205,
+    "staging_bandwidth_gbps": 131.204,
+    "gpu_allocated": false,
+    "gpudirect_claimed": false,
+    "returncode": 0
+  },
+  "network_rdma": {
+    "attempted": false,
+    "reason": "no peer configured"
+  },
+  "dgx_spark_theoretical_limit_gbps": 200,
+  "claims": {
+    "gpudirect_rdma": false,
+    "metrics_are_separate": true
+  }
+}

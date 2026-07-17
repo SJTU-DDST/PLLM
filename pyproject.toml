@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pllm"
+version = "0.1.0"
+description = "Foreground-aware vLLM resource scheduler for Linux desktops"
+requires-python = ">=3.12"
+dependencies = [
+  "Flask>=3.1,<4",
+  "requests>=2.32,<3",
+  "psutil>=7,<8",
+  "nvidia-ml-py>=13,<14",
+  "PySide6>=6.8,<7",
+  "dbus-next>=0.2.3,<1",
+]
+
+[project.optional-dependencies]
+inference = ["vllm==0.25.1", "fastsafetensors==0.3.3"]
+test = ["pytest>=8,<10", "pytest-cov>=6,<8"]
+
+[project.scripts]
+pllm-daemon = "pllm.daemon:main"
+pllm-desktop = "pllm.desktop:main"
+
+[tool.setuptools.packages.find]
+include = ["pllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

@@ -1,0 +1,15 @@
+[Unit]
+Description=PLLM foreground-aware vLLM scheduler
+After=graphical-session.target network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@ROOT_DIR@
+ExecStart=@HOME@/anaconda3/envs/pllm/bin/python -m pllm.daemon
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+
