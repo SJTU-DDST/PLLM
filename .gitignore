@@ -12,6 +12,7 @@ cufile.log
 results/*.json
 results/*.csv
 results/*.png
+results/eer-memory-*.tsv
 !results/.gitkeep
 !results/mock_integration.json
 !results/rdma_bench.json
