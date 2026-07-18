@@ -133,7 +133,7 @@
             </div>
           </div>
           <div class="expert-metrics">
-            <div><span>每层 Slots</span><strong>{{ expertPlan.slots_per_layer ?? '--' }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
+            <div><span>{{ expertResidency.data_plane_ready ? '实时 Slots' : '规划 Slots' }}</span><strong>{{ expertActiveSlots || '--' }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
             <div><span>投影驻留</span><strong>{{ metric(expertPlan.projected_resident_gib, ' GiB', 1) }}</strong></div>
             <div><span>投影释放</span><strong>{{ metric(expertPlan.projected_reclaim_gib, ' GiB', 1) }}</strong></div>
             <div><span>预计 Miss 流量</span><strong>{{ metric(expertPlan.estimated_miss_gib_s, ' GiB/s', 2) }}</strong></div>
@@ -148,7 +148,7 @@
             <i data-lucide="route"></i>
             <strong>{{ expertPlan.action || 'awaiting_plan' }}</strong>
             <span>{{ expertPlan.reason || expertResidency.guardrail || 'recommendation_only_no_vllm_weight_mutation' }}</span>
-            <em>Top-k {{ expertModel.top_k || 22 }} · {{ expertPlan.executable ? 'EXECUTABLE' : 'NOT EXECUTABLE' }}</em>
+            <em>Top-k {{ expertModel.top_k || 22 }} · PLAN {{ expertPlan.slots_per_layer ?? '--' }} · {{ expertPlan.executable ? 'EXECUTABLE' : 'NOT EXECUTABLE' }}</em>
             <button class="apply-expert" :disabled="!expertPlan.executable || expertActionBusy" @click="applyExpertPlan" title="应用物理专家槽位">
               <i data-lucide="refresh-cw"></i><span>{{ expertActionBusy ? '切换中' : '应用槽位' }}</span>
             </button>

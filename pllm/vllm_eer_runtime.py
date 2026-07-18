@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_EXPERT_CACHE_DIR, pllm_runtime_dir
 from .expert_dataplane import ExpertSlotDataPlane
 from .expert_catalog import ExpertCatalog
 from .expert_store import (
@@ -37,6 +38,61 @@ RUNTIME_TENSORS = (
 )
 
 
+def low_memory_nvfp4_scale_factor(
+    marlin_scales: Any, a_dtype: Any | None = None
+) -> float:
+    """Compute vLLM's exact NVFP4 scale factor without a full FP32 copy."""
+    import torch
+
+    if a_dtype is not None and a_dtype == torch.half:
+        return 1.0
+    max_scale = marlin_scales.amax()
+    if bool(max_scale > 0):
+        max_val = max_scale.float() * (2**7)
+        if bool(max_val < 448 * (2**7)):
+            return (448 * (2**7) / max_val).log2().floor().exp2().item()
+    return 1.0
+
+
+def tensor_storage_bytes(tensor: Any) -> bytes:
+    """Return contiguous tensor storage bytes, including scalar tensors."""
+    import torch
+
+    flat = tensor.detach().contiguous().reshape(-1)
+    return flat.view(torch.uint8).cpu().numpy().tobytes()
+
+
+def release_export_layer(layer: Any) -> None:
+    """Drop a persisted export layer so conversion peak is layer-bounded."""
+    import torch
+
+    method = layer.quant_method
+    method.moe_kernel = None
+    method.moe_quant_config = None
+    for name in RUNTIME_TENSORS:
+        if name in layer._parameters:
+            parameter = layer._parameters.pop(name)
+            parameter.grad = None
+    if hasattr(layer, "workspace"):
+        delattr(layer, "workspace")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def flatten_cache_tensors(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        items = value.values()
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return [] if value is None else [value]
+    flattened: list[Any] = []
+    for item in items:
+        flattened.extend(flatten_cache_tensors(item))
+    return flattened
+
+
 @dataclass(slots=True, frozen=True)
 class EERRuntimeConfig:
     mode: str
@@ -51,15 +107,15 @@ class EERRuntimeConfig:
     rdma_token_file: Path | None
     rdma_allocator: str
     rdma_device: str
+    rdma_ib_port: int
+    rdma_gid_index: int
 
     @classmethod
     def from_environment(cls) -> "EERRuntimeConfig":
         mode = os.getenv("PLLM_EER_MODE", "off").strip().lower()
         if mode not in {"off", "export", "elastic"}:
             raise ValueError("PLLM_EER_MODE must be off, export, or elastic")
-        runtime_dir = Path(
-            os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        )
+        runtime_dir = pllm_runtime_dir()
         return cls(
             mode=mode,
             slots_per_layer=int(os.getenv("PLLM_EER_SLOTS_PER_LAYER", "128")),
@@ -71,7 +127,7 @@ class EERRuntimeConfig:
                 )
             ).expanduser(),
             cache_dir=Path(
-                os.getenv("PLLM_EER_CACHE_DIR", "/mnt/ssd-storage/pllm-experts")
+                os.getenv("PLLM_EER_CACHE_DIR", str(DEFAULT_EXPERT_CACHE_DIR))
             ).expanduser(),
             cache_quota_bytes=int(
                 float(os.getenv("PLLM_EER_CACHE_QUOTA_GIB", "80")) * 1024**3
@@ -94,6 +150,8 @@ class EERRuntimeConfig:
             ),
             rdma_allocator=os.getenv("PLLM_EER_RDMA_ALLOCATOR", "cuda-host"),
             rdma_device=os.getenv("PLLM_EER_RDMA_DEVICE", "").strip(),
+            rdma_ib_port=int(os.getenv("PLLM_EER_RDMA_IB_PORT", "1")),
+            rdma_gid_index=int(os.getenv("PLLM_EER_RDMA_GID_INDEX", "0")),
         )
 
 
@@ -114,13 +172,12 @@ class TorchMarlinSlotSink:
         tensors: list[tuple[str, str, tuple[int, ...], bytes]] = []
         for name, dtype, shape, _device in self._specs:
             tensor = getattr(self.layer, name).data[physical_slot]
-            content = tensor.detach().contiguous().view(self.torch.uint8).cpu()
             tensors.append(
                 (
                     name,
                     _dtype_name(dtype),
                     tuple(shape),
-                    content.numpy().tobytes(),
+                    tensor_storage_bytes(tensor),
                 )
             )
         return ExpertPayload.create(
@@ -250,6 +307,8 @@ class EERRuntime:
                 token_file=config.rdma_token_file or "",
                 allocator=config.rdma_allocator,
                 device=config.rdma_device,
+                ib_port=config.rdma_ib_port,
+                gid_index=config.rdma_gid_index,
             )
             sources.append(remote_store)
         if (
@@ -273,6 +332,17 @@ class EERRuntime:
         self._command_lock = threading.RLock()
         self._control_server: _ThreadedUnixServer | None = None
         self._control_thread: threading.Thread | None = None
+        self._loader_cache_released = False
+
+    def release_loader_cache(self) -> None:
+        if self._loader_cache_released:
+            return
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._loader_cache_released = True
 
     def start_control_server(self) -> None:
         if self.config.mode == "off" or self._control_server is not None:
@@ -295,11 +365,12 @@ class EERRuntime:
             current = get_current_vllm_config()
             if current.model_config is not None and not current.model_config.enforce_eager:
                 raise RuntimeError("PLLM EER requires vLLM --enforce-eager")
-            backend = str(layer.quant_method.nvfp4_backend.value)
+            backend = str(layer.quant_method.nvfp4_backend.value).lower()
             if backend != "marlin":
                 raise RuntimeError(f"PLLM EER requires the Marlin MoE backend, found {backend}")
             if layer.quant_method.is_monolithic:
                 raise RuntimeError("PLLM EER requires a modular MoE kernel with visible Top-k IDs")
+        self.start_control_server()
         sink = TorchMarlinSlotSink(layer, layer_id, self.fingerprint)
         if self.config.mode == "export":
             mapping = getattr(layer, "_pllm_eer_logical_to_slot", None)
@@ -310,6 +381,7 @@ class EERRuntime:
                 self.exported_objects += 1
             if self.exported_objects >= self.expected_objects:
                 self._write_export_manifest()
+            release_export_layer(layer)
             return
         if self.config.mode != "elastic":
             return
@@ -567,9 +639,11 @@ def install() -> EERRuntime | None:
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4FusedMoE,
     )
+    from vllm.model_executor.layers.quantization.utils import marlin_utils_fp4
     from vllm.model_executor.model_loader import ep_weight_filter
     from vllm.model_executor.model_loader import weight_utils
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     runtime = EERRuntime(config)
     original_create = ModelOptNvFp4FusedMoE.create_weights
@@ -578,6 +652,7 @@ def install() -> EERRuntime | None:
     original_process = ModelOptNvFp4FusedMoE.process_weights_after_loading
     original_apply = ModelOptNvFp4FusedMoE.apply
     original_init_filter = DefaultModelLoader._init_ep_weight_filter
+    original_init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales
 
     def create_weights(method, layer, num_experts, *args, **kwargs):
         effective = (
@@ -620,6 +695,7 @@ def install() -> EERRuntime | None:
         return original_map(layer, expert_id)
 
     def process_weights(method, layer):
+        runtime.release_loader_cache()
         result = original_process(method, layer)
         runtime.initialize_layer(layer)
         return result
@@ -641,6 +717,14 @@ def install() -> EERRuntime | None:
         expert_id = ep_weight_filter.parse_expert_id(weight_name)
         return expert_id is not None and expert_id not in local_expert_ids
 
+    def init_fp8_kv_scales(model_runner):
+        caches = model_runner.kv_caches
+        model_runner.kv_caches = flatten_cache_tensors(caches)
+        try:
+            return original_init_fp8_kv_scales(model_runner)
+        finally:
+            model_runner.kv_caches = caches
+
     ep_weight_filter_should_skip = ep_weight_filter.should_skip_weight
 
     ModelOptNvFp4FusedMoE.create_weights = create_weights
@@ -651,7 +735,10 @@ def install() -> EERRuntime | None:
     DefaultModelLoader._init_ep_weight_filter = init_expert_filter
     ep_weight_filter.should_skip_weight = should_skip_weight
     weight_utils.should_skip_weight = should_skip_weight
-    runtime.start_control_server()
+    GPUModelRunner.init_fp8_kv_scales = init_fp8_kv_scales
+    marlin_utils_fp4._nvfp4_compute_scale_factor = (
+        low_memory_nvfp4_scale_factor
+    )
     _RUNTIME = runtime
     _INSTALLED = True
     return runtime

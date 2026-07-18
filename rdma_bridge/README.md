@@ -32,7 +32,7 @@ eligible for a Marlin physical slot.
 ```bash
 # Warm-source host
 rdma_bridge/build/pllm-rdma-store \
-  --server /mnt/ssd-storage/pllm-experts --port 17900 --device mlx5_0 \
+  --server /mnt/ssd-storage/$USER/pllm-experts --port 17900 --device mlx5_0 \
   --token-file ~/.config/pllm/rdma-token
 
 # DGX Spark compatible host-staged fetch

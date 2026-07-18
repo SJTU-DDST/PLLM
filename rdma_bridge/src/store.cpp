@@ -419,7 +419,7 @@ Options parse_options(int argc, char** argv) {
       std::exit(0);
     } else throw std::runtime_error("unknown argument: " + argument);
   }
-  if (options.server == options.client.empty()) {
+  if (options.server == !options.client.empty()) {
     throw std::runtime_error("select exactly one of --server or --client");
   }
   if (!options.server && (options.key.empty() || options.file.empty())) {

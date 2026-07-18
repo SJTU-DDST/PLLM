@@ -58,7 +58,10 @@ def test_manual_yield_escalation_and_wake(tmp_path: Path) -> None:
     monitor = FakeMonitor()
     storage = Storage(tmp_path / "events.sqlite3")
     controller = PLLMController(
-        PLLMConfig(hibercache_dir=str(tmp_path / "cache")),
+        PLLMConfig(
+            hibercache_dir=str(tmp_path / "cache"),
+            expert_runtime_socket=str(tmp_path / "pllm-eer.sock"),
+        ),
         storage,
         monitor=monitor,
         manager=manager,

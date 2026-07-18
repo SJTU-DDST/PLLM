@@ -25,6 +25,20 @@ def load_rows(paths: list[Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def restore_seconds(row: dict[str, Any]) -> float:
+    direct = float(row.get("wake_seconds", 0.0))
+    if direct > 0:
+        return direct
+    return sum(
+        float(row.get(key, 0.0))
+        for key in (
+            "wake_weights_seconds",
+            "reload_weights_seconds",
+            "wake_kv_seconds",
+        )
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a PLLM p95 cost profile")
     parser.add_argument("inputs", nargs="+", type=Path)
@@ -47,7 +61,7 @@ def main() -> None:
         sleep_ms = float(row.get("sleep_seconds", 0.0)) * 1000
         if sleep_ms > 0:
             (yields if level == 0 else hibernates).append(sleep_ms)
-        wake_ms = float(row.get("wake_seconds", 0.0)) * 1000
+        wake_ms = restore_seconds(row) * 1000
         if wake_ms > 0:
             local_restores.append(wake_ms)
         remote_ms = float(row.get("remote_restore_seconds", 0.0)) * 1000

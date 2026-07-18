@@ -3,6 +3,18 @@
 - `mock_integration.json` records the GPU-safe `mode=keep` control validation.
 - `rdma_bench.json` separates registered-host staging from an unrun network test.
 - `pllm-dashboard-v2.png` and `pllm-dashboard-mobile-v2.png` are real Vue renders.
+- `pllm-dashboard-live-desktop.png` and `pllm-dashboard-live-mobile.png` render
+  the real Nemotron/EER daemon rather than mock data.
 - `pllm-overlay-v2.png` is the updated PySide6 overlay render.
 - `ui-demo.png` is retained from the first prototype for comparison.
-- Real Nemotron Level 1/2 JSON and generated SVG charts are intentionally absent until the GPU is idle.
+- `nemotron_eer128_summary.json` summarizes the real 120B NVFP4 + 128-slot EER run.
+- `nemotron_eer128_level1.json` and `nemotron_eer128_level2.json` contain real sleep measurements.
+- `nemotron_eer128_continuity_level0.json` and
+  `nemotron_eer128_determinism_control.json` preserve both the same-stream result
+  and the independent-request determinism limitation.
+- `rdma_store_live.json` records real RC RDMA PUT/GET integrity and keeps host
+  staging copy bandwidth separate from unmeasured network bandwidth.
+- `nemotron_foreground_admission.json` records the real 60GiB CUDA allocation
+  changing from OOM while resident to success after PLLM Level 2.
+- `nemotron_calibration.json` is the Level 2 cost profile derived from the live
+  segmented sleep/reload/wake measurement.

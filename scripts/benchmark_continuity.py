@@ -10,12 +10,16 @@ from typing import Any
 import requests
 
 
+def generated_text(payload: dict[str, Any]) -> str:
+    return "".join(str(payload.get(key) or "") for key in ("reasoning", "content"))
+
+
 def completion(base: str, payload: dict[str, Any]) -> str:
     response = requests.post(
         f"{base}/v1/chat/completions", json=payload, timeout=(10, 1800)
     )
     response.raise_for_status()
-    return str(response.json()["choices"][0]["message"].get("content", ""))
+    return generated_text(response.json()["choices"][0]["message"])
 
 
 def post(base: str, path: str, **kwargs) -> None:
@@ -65,7 +69,8 @@ def main() -> None:
                     if not line.startswith(b"data: ") or line == b"data: [DONE]":
                         continue
                     event = json.loads(line[6:])
-                    content = event["choices"][0].get("delta", {}).get("content")
+                    delta = event["choices"][0].get("delta", {})
+                    content = generated_text(delta)
                     if content:
                         chunks.append(str(content))
                         if len(chunks) >= args.pause_after_chunks:

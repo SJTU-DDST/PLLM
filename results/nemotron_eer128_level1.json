@@ -1,0 +1,10 @@
+{
+  "timestamp": 1784379203.7488768,
+  "level": 1,
+  "mode": "keep",
+  "sleep_seconds": 16.630825902801007,
+  "gpu_used_before_gb": 44.63861083984375,
+  "gpu_used_after_gb": 1.53509521484375,
+  "reclaimed_gb": 43.103515625,
+  "wake_seconds": 0.6388047481887043
+}

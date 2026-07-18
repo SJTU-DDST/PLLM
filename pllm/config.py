@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -12,6 +13,21 @@ from .models import PolicyMode
 DEFAULT_MODEL_PATH = Path(
     "/mnt/ssd-storage/shared_models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 )
+DEFAULT_EXPERT_CACHE_DIR = (
+    Path("/mnt/ssd-storage")
+    / pwd.getpwuid(os.getuid()).pw_name
+    / "pllm-experts"
+)
+
+
+def pllm_runtime_dir() -> Path:
+    configured = os.getenv("XDG_RUNTIME_DIR")
+    candidates = [Path(configured)] if configured else []
+    candidates.append(Path(f"/run/user/{os.getuid()}"))
+    for candidate in candidates:
+        if candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK):
+            return candidate
+    return Path("/tmp") / f"pllm-{os.getuid()}"
 
 
 @dataclass(slots=True)
@@ -53,13 +69,15 @@ class PLLMConfig:
     hiberstate_rdma_token_file: str = "~/.config/pllm/rdma-token"
     hiberstate_rdma_allocator: str = "cuda-host"
     hiberstate_rdma_device: str = ""
+    hiberstate_rdma_ib_port: int = 1
+    hiberstate_rdma_gid_index: int = 0
     expert_residency_enabled: bool = True
     expert_data_plane_enabled: bool = True
     # Physical layer rebuild remains opt-in until model-specific validation passes.
     expert_auto_resize_enabled: bool = False
     expert_resize_cooldown_seconds: float = 60.0
     expert_slots_per_layer: int = 128
-    expert_runtime_cache_dir: str = "/mnt/ssd-storage/pllm-experts"
+    expert_runtime_cache_dir: str = str(DEFAULT_EXPERT_CACHE_DIR)
     expert_runtime_cache_quota_gib: float = 80.0
     expert_runtime_socket: str = ""
     expert_rdma_port: int = 17900
@@ -148,6 +166,8 @@ class PLLMConfig:
                 "expert_rdma_port",
                 "hiberstate_chunk_mb",
                 "hiberstate_rdma_port",
+                "hiberstate_rdma_ib_port",
+                "hiberstate_rdma_gid_index",
             }:
                 value = int(value)
             if key in {
@@ -184,10 +204,7 @@ class PLLMConfig:
     def resolved_expert_runtime_socket(self) -> Path:
         if self.expert_runtime_socket:
             return Path(self.expert_runtime_socket).expanduser()
-        runtime_dir = Path(
-            os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        )
-        return runtime_dir / "pllm-eer.sock"
+        return pllm_runtime_dir() / "pllm-eer.sock"
 
 
 def _toml_value(value: Any) -> str:

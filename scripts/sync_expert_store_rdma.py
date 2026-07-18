@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pwd
 from pathlib import Path
 
 from pllm.expert_store import (
@@ -15,7 +17,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Replicate checksummed runtime experts to an RDMA warm source"
     )
-    parser.add_argument("--root", type=Path, default=Path("/mnt/ssd-storage/pllm-experts"))
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=(
+            Path("/mnt/ssd-storage")
+            / pwd.getpwuid(os.getuid()).pw_name
+            / "pllm-experts"
+        ),
+    )
     parser.add_argument("--peer", required=True)
     parser.add_argument("--port", type=int, default=17900)
     parser.add_argument(
@@ -27,6 +37,8 @@ def main() -> None:
     parser.add_argument("--token-file", type=Path, default=Path.home() / ".config/pllm/rdma-token")
     parser.add_argument("--allocator", choices=("aligned", "cuda-host"), default="aligned")
     parser.add_argument("--device", default="")
+    parser.add_argument("--ib-port", type=int, default=1)
+    parser.add_argument("--gid-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
@@ -46,6 +58,8 @@ def main() -> None:
         token_file=args.token_file,
         allocator=args.allocator,
         device=args.device,
+        ib_port=args.ib_port,
+        gid_index=args.gid_index,
     )
     paths = sorted(args.root.glob("layer-*/expert-*.pllmex"))[args.start :]
     if args.limit > 0:

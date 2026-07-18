@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from pllm.config import PLLMConfig
+from pllm.config import PLLMConfig, pllm_runtime_dir
 from pllm.storage import Storage
 from scripts.calibrate_agent import percentile
 
@@ -24,6 +25,14 @@ def test_config_round_trip(tmp_path: Path) -> None:
     assert loaded.expert_io_budget_gib_s == 1.25
     assert loaded.expert_data_plane_enabled is True
     assert loaded.expert_auto_resize_enabled is False
+
+
+def test_runtime_dir_falls_back_when_configured_directory_is_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
+
+    assert pllm_runtime_dir() == Path("/tmp") / f"pllm-{os.getuid()}"
 
 
 def test_storage_records_events_and_replays(tmp_path: Path) -> None:

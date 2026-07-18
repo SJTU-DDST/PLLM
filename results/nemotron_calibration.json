@@ -1,0 +1,9 @@
+{
+  "yield_latency_ms": 40.0,
+  "hibernate_latency_ms": 130.98963513039052,
+  "local_restore_ms": 41916.38108086772,
+  "remote_restore_ms": 9000.0,
+  "hibernate_reclaim_ratio": 0.9572592202646212,
+  "foreground_duration_seconds": 300.0,
+  "sample_count": 1
+}

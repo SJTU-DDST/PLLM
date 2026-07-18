@@ -1,0 +1,15 @@
+{
+  "created_at": 1784379601.161143,
+  "level": 0,
+  "mode": "keep",
+  "pause_at_chunk": 3,
+  "chunks_during_pause": 0,
+  "stream_finished": true,
+  "stream_error": [],
+  "pause_and_restore_seconds": 15.188855778891593,
+  "baseline_characters": 62,
+  "resumed_characters": 64,
+  "exact_match": false,
+  "baseline_sha256": "80e5237ac11dac997fca85a3de6994215ffbc7280e4995ecb0c1c4bea055ce2e",
+  "resumed_sha256": "01bb60ed7d956936d4aaadfb11a06a977e0d2d8a27a3dd192a387942c63ebcbb"
+}

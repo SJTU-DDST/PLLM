@@ -93,6 +93,12 @@ createApp({
     expertPlan() { return this.expertResidency.plan || {}; },
     expertModel() { return this.expertResidency.model || {}; },
     expertDataPlane() { return this.expertResidency.data_plane || {}; },
+    expertActiveSlots() {
+      if (this.expertResidency.data_plane_ready) {
+        return Number(this.expertDataPlane.slots_per_layer ?? 0);
+      }
+      return Number(this.expertPlan.slots_per_layer ?? 0);
+    },
     expertEvidenceLabel() {
       if (this.expertResidency.data_plane_ready) return "LIVE DATA PLANE";
       if (this.judgeMode) return "SIMULATED EER · HISTORICAL REPLAY";
@@ -101,7 +107,7 @@ createApp({
     expertLayerCells() {
       const count = Number(this.expertModel.moe_layers || 40);
       const total = Number(this.expertModel.experts_per_layer || 512);
-      const slots = Number(this.expertPlan.slots_per_layer ?? total);
+      const slots = this.expertActiveSlots || total;
       const fill = Math.max(0, Math.min(100, slots / Math.max(1, total) * 100));
       return Array.from({ length: count }, (_, index) => ({ index: index + 1, fill, slots }));
     },

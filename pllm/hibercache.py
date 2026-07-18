@@ -27,6 +27,8 @@ class HiberCacheManager:
                 token_file=config.hiberstate_rdma_token_file,
                 allocator=config.hiberstate_rdma_allocator,
                 device=config.hiberstate_rdma_device,
+                ib_port=config.hiberstate_rdma_ib_port,
+                gid_index=config.hiberstate_rdma_gid_index,
             )
         self.state_store = HiberStateStore(
             self.root / "live-state",

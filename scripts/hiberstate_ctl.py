@@ -37,6 +37,8 @@ def main() -> None:
         "--allocator", choices=("aligned", "cuda-host"), default="cuda-host"
     )
     parser.add_argument("--device", default="")
+    parser.add_argument("--ib-port", type=int, default=1)
+    parser.add_argument("--gid-index", type=int, default=0)
     args = parser.parse_args()
 
     transport = None
@@ -49,6 +51,8 @@ def main() -> None:
             timeout_seconds=120.0,
             allocator=args.allocator,
             device=args.device,
+            ib_port=args.ib_port,
+            gid_index=args.gid_index,
         )
     store = HiberStateStore(args.root, transport=transport)
     if args.command == "status":

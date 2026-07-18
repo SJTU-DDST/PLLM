@@ -189,44 +189,37 @@ PLLM 不以 router prediction 替代真实 routing。Prediction set 只决定提
 
 ## 7. 当前实现与证据边界
 
-### 已实现并可在无大模型环境验证
+### 已在真实模型/硬件上验证
 
-- conda `pllm` 环境、vLLM 0.25.1 版本约束和本地模型只读配置；
-- 前台监控、策略成本模型、状态机和 vLLM service discovery；
-- Level-0 `mode=keep` mock 流暂停/恢复；
-- Flask OpenAI proxy、SQLite、Vue 控制中心和 PySide6 悬浮窗；
-- HiberCache 配置与版本守卫 patch；
-- RDMA device/PD/MR 和 host staging 微基准；
-- header-only expert catalog、20,480 个 expert object 索引、严格 Top-22 trace schema 和 synthetic no-GPU replay；
-- route-history/co-activation predictor、split-conformal rank set、exact-route cache simulator 和 resource-envelope phase planner；
-- Expert Residency controller、`GET/POST /api/v1/expert-residency*`、UMA/独显容量域选择和 Vue 规划面板；
-- Reviewer 与 Rebuttal 双智能体、至少三轮迭代约束和产物归档。
+- 完整回归 `55 passed`，CMake、compileall 和 shell syntax 通过；
+- 完整导出 20,480 个 Marlin runtime experts、约 60GiB，跨 40 层抽样 checksum 全部通过；
+- 128-slot ModelOpt NVFP4/Marlin EER 启动、actual Top-22 blocking load 和真实生成；
+- vLLM Level 1/2 与 PLLM API hibernate/wake；Level 2 在 0.131--0.185s 回收约 43--44GiB；
+- 恢复后真实 OpenAI proxy 请求 HTTP 200，但本地恢复约 39--42s，冷槽请求约 33s；
+- 60GiB 前台 CUDA allocation 从模型常驻 OOM 变为休眠后成功；
+- 20MiB RC RDMA PUT/GET integrity、token/path guard、Python store 与 15MiB live-state carrier；
+- 实时 NVML/EER API、SSE、Vue 桌面/移动界面与 PySide6 悬浮窗。
 
-### 已实现但本轮未运行
+### 已实现但只具部分证据
 
-- positional-`pread` expert catalog、SHA-256 `.pllmex` SSD tier、ModelOpt NVFP4/Marlin physical slot runtime；
-- actual Top-22 blocking miss、logical-to-slot publish、quiesced destructive resize 和 Sleep Mode suspend/resume；
-- C++20 RC QP expert-object get/put、remote commit ACK、token authentication 与 host-staged RDMA source；
-- token-boundary mutation guard、串行 runtime command、resize `transitioning/faulted` fail-closed 状态；
-- 64MiB 分块、双层 SHA-256、manifest-last 的 live-state SSD/RDMA 事务承载层；
-- deferred unit/API tests、runtime export/elastic 启动脚本和 RDMA replication 工具。
+- route-history/conformal predictor 只有 synthetic trace，不能代表真实 Nemotron 路由局部性；
+- Level 0 同一 HTTP stream 可以冻结且不重连，但跨独立请求 bitwise determinism 失败，不能声称 exact token resume；
+- live-state carrier 的 SSD/RDMA transaction 已验证，Mamba/KV/RNG serializer 尚未接入；
+- 128 slots 的 exact fused Top-22 需要 `max_num_batched_tokens<=5`，路径正确但性能不可接受；
+- 自动 destructive resize 仍默认关闭，40 层 fault injection 尚不完整。
 
-### 尚未实现或尚未有真实模型证据
+### 仍待完成
 
-- 真实 vLLM route tracer、真实 predictor calibration 和在线 drift detector；
-- 新数据面的编译、单元测试、真实 vLLM/Marlin correctness 和双机 RDMA 验证；
-- vLLM/NemotronH 的 Mamba/KV/RNG serializer 与 restore hook（通用事务承载层已实现）；
-- 真实 75GiB release/restore、TTFT、功耗和前台 throughput；
-- 双机端到端 expert transfer；
-- greedy/stochastic stream continuity。
+- 真实 route tracer、predictor calibration、online drift detector 与 EER baseline matrix；
+- 独立双机 RDMA bandwidth 和 DGX Spark ConnectX-7/UMA 测试；
+- Blender、游戏、NVENC 的真实 throughput/jank/energy；
+- NemotronH Mamba/KV/RNG restore 与 greedy token equality。
 
-此前测得的 16MiB host staging memcpy 和 MR registration 只能说明 host buffer 路径可运行，不是网络 RDMA 或模型恢复吞吐。
-
-新数据面本轮只完成实现，不执行测试。它不能引用此前 39 项测试作为自身证据，也不能把 `pllm-rdma-store` 源码写成已测网络带宽。完整设计、启动顺序和待验收门槛见 `docs/数据面实现与待验收说明.md`。
+MR staging copy 与网络 bandwidth 继续分开报告；当前 RC loopback 只证明 QP/MR/PUT/GET 数据语义，不提供双机吞吐结论。详细结果见 `docs/实验报告.md`。
 
 ## 8. 实验计划
 
-迭代 2 已生成 `results/expert_residency_simulation.json`。它只验证 control-plane accounting：synthetic calibration coverage 1.0、set size 263，在刻意切换 domain 的 synthetic test 上 coverage 为 0，planner 因 prefetch debt 选择 hibernate。该失败被保留为 drift fallback 测试，不是 Nemotron predictor 结论。另一个 95% hit 输入仅用于验证 elastic phase，明确标记为 hypothetical。迭代 3 当时的实时 dry-run API 也只消费这一类假设输入；它固定返回 `data_plane_ready=false` 与 `executable=false`，不会触发 vLLM 权重修改。后续数据面代码只有在 vLLM Unix runtime 报告 40 层全部注册后才会变为 executable，且自动 resize 默认关闭，当前没有运行到该状态。
+迭代 2 的 `results/expert_residency_simulation.json` 仍只验证 control-plane accounting：synthetic calibration coverage 1.0、set size 263，在 domain shift 上 coverage 为 0，不能升级为真实 predictor 结论。当前真实 runtime 已报告 40 层、128 physical slots 和 `data_plane_ready=true`；前端因此可以展示 LIVE 数据面，但 planner 的 256-slot 建议必须与实际 128 slots 分栏。自动 resize 保持默认关闭。
 
 ### 8.1 Expert trace 与预测
 
@@ -286,7 +279,7 @@ PLLM 不以 router prediction 替代真实 routing。Prediction set 只决定提
 
 PLLM 最新方案不再把资源让渡等同于“暂停并重载整模型”。它利用 Nemotron routed experts 占权重主体的结构，在保持 Top-22 完全不变的前提下提供可收缩 residency；用前台资源包络同时约束 cache、I/O、decode duty cycle 和 hibernation；当 paging 不可行时，再以事务方式保护小型 live state 并丢弃大权重。
 
-这比单独的 expert prediction、Sleep Mode 或 SSD loader 更接近一个完整研究问题。数据面源码现已实现，但尚未编译或运行；Mamba transaction 和真实实验仍未完成。比赛材料继续区分“已验证”“实现未测”“设计中”和“待验证”，创新性最终由真实 expert traces、前台 SLO、能耗和精确恢复证据决定。
+这比单独的 expert prediction、Sleep Mode 或 SSD loader 更接近一个完整研究问题。数据面已经在 RTX PRO 上运行并证明快速释放与前台显存 admission，但也暴露出 fused Top-22 batch 上界、约 40 秒恢复和跨请求非确定性。Mamba transaction、真实路由预测、前台吞吐和 DGX Spark 实验仍未完成；创新性最终由这些问题能否形成新算法并取得 Pareto 改善决定。
 
 ## 参考资料
 

@@ -356,6 +356,8 @@ class RDMABridgeTransport:
         timeout_seconds: float = 30.0,
         allocator: str = "cuda-host",
         device: str = "",
+        ib_port: int = 1,
+        gid_index: int = 0,
     ) -> None:
         if allocator not in {"aligned", "cuda-host"}:
             raise ValueError("RDMA allocator must be aligned or cuda-host")
@@ -366,6 +368,8 @@ class RDMABridgeTransport:
         self.timeout_seconds = timeout_seconds
         self.allocator = allocator
         self.device = device
+        self.ib_port = ib_port
+        self.gid_index = gid_index
 
     @property
     def available(self) -> bool:
@@ -392,6 +396,10 @@ class RDMABridgeTransport:
             str(path),
             "--allocator",
             self.allocator,
+            "--ib-port",
+            str(self.ib_port),
+            "--gid-index",
+            str(self.gid_index),
         ]
         if self.device:
             command.extend(["--device", self.device])
@@ -422,6 +430,8 @@ class RDMAExpertStore:
         timeout_seconds: float = 30.0,
         allocator: str = "cuda-host",
         device: str = "",
+        ib_port: int = 1,
+        gid_index: int = 0,
     ) -> None:
         self.peer = peer
         self.port = port
@@ -435,6 +445,8 @@ class RDMAExpertStore:
             timeout_seconds=timeout_seconds,
             allocator=allocator,
             device=device,
+            ib_port=ib_port,
+            gid_index=gid_index,
         )
 
     def contains(self, layer: int, expert: int) -> bool:
