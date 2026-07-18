@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -16,6 +17,7 @@ class ForegroundProvider:
         self.fallback_file = Path(env_file).expanduser() if env_file else None
         self._bus = None
         self._interface = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._last_connect_attempt = 0.0
 
     def get(self) -> ForegroundApp:
@@ -43,7 +45,10 @@ class ForegroundProvider:
         if self._interface is None and not self._connect_dbus():
             return ForegroundApp()
         try:
-            pid, app_id, title, wm_class = self._interface.call_get_active()
+            assert self._loop is not None
+            pid, app_id, title, wm_class = self._loop.run_until_complete(
+                self._interface.call_get_active()
+            )
             return ForegroundApp(
                 pid=int(pid),
                 app_id=str(app_id),
@@ -52,8 +57,7 @@ class ForegroundProvider:
                 available=True,
             )
         except Exception:
-            self._interface = None
-            self._bus = None
+            self._reset_dbus()
             return ForegroundApp()
 
     def _connect_dbus(self) -> bool:
@@ -63,11 +67,18 @@ class ForegroundProvider:
         self._last_connect_attempt = now
         try:
             from dbus_next import BusType
-            from dbus_next.sync import MessageBus
+            from dbus_next.aio import MessageBus
 
-            self._bus = MessageBus(bus_type=BusType.SESSION).connect()
-            introspection = self._bus.introspect(
-                "org.pllm.Foreground", "/org/pllm/Foreground"
+            self._loop = asyncio.new_event_loop()
+
+            async def connect_bus():
+                return await MessageBus(bus_type=BusType.SESSION).connect()
+
+            self._bus = self._loop.run_until_complete(connect_bus())
+            introspection = self._loop.run_until_complete(
+                self._bus.introspect(
+                    "org.pllm.Foreground", "/org/pllm/Foreground"
+                )
             )
             proxy = self._bus.get_proxy_object(
                 "org.pllm.Foreground", "/org/pllm/Foreground", introspection
@@ -75,6 +86,17 @@ class ForegroundProvider:
             self._interface = proxy.get_interface("org.pllm.Foreground")
             return True
         except Exception:
-            self._bus = None
-            self._interface = None
+            self._reset_dbus()
             return False
+
+    def _reset_dbus(self) -> None:
+        if self._bus is not None:
+            try:
+                self._bus.disconnect()
+            except Exception:
+                pass
+        self._interface = None
+        self._bus = None
+        if self._loop is not None and not self._loop.is_running():
+            self._loop.close()
+        self._loop = None

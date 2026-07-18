@@ -41,6 +41,7 @@ class Extension {
             BUS_NAME,
             Gio.BusNameOwnerFlags.NONE,
             null,
+            null,
             null
         );
         this._focusSignal = global.display.connect(
@@ -87,4 +88,3 @@ class Extension {
 function init() {
     return new Extension();
 }
-
