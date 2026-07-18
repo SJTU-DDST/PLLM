@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "operation": "get",
+  "workers": 4,
+  "objects": 5120,
+  "bytes": 15858978307,
+  "wall_seconds": 4.012155466945842,
+  "wall_effective_gbps": 31.6218619894553,
+  "max_worker_data_seconds": 2.75147,
+  "data_phase_effective_gbps": 46.11056142934505,
+  "allocator": "cuda-host",
+  "persistent_qp_per_worker": true,
+  "one_sided": true,
+  "remote_disk_io": false,
+  "workers_detail": [
+    {
+      "ready": true,
+      "operation": "get",
+      "objects": 1280,
+      "bytes": 3964744546,
+      "seconds": 2.72088,
+      "effective_gbps": 11.6572,
+      "pool_bytes": 17179869184,
+      "slot_bytes": 3145728,
+      "queue_depth": 32,
+      "device": "mlx5_0",
+      "persistent_qp": true,
+      "one_sided": true,
+      "remote_disk_io": false,
+      "gpudirect_claimed": false,
+      "progress": [
+        "1280/1280"
+      ]
+    },
+    {
+      "ready": true,
+      "operation": "get",
+      "objects": 1280,
+      "bytes": 3964744564,
+      "seconds": 2.68389,
+      "effective_gbps": 11.8179,
+      "pool_bytes": 17179869184,
+      "slot_bytes": 3145728,
+      "queue_depth": 32,
+      "device": "mlx5_0",
+      "persistent_qp": true,
+      "one_sided": true,
+      "remote_disk_io": false,
+      "gpudirect_claimed": false,
+      "progress": [
+        "1280/1280"
+      ]
+    },
+    {
+      "ready": true,
+      "operation": "get",
+      "objects": 1280,
+      "bytes": 3964744588,
+      "seconds": 2.6946,
+      "effective_gbps": 11.7709,
+      "pool_bytes": 17179869184,
+      "slot_bytes": 3145728,
+      "queue_depth": 32,
+      "device": "mlx5_0",
+      "persistent_qp": true,
+      "one_sided": true,
+      "remote_disk_io": false,
+      "gpudirect_claimed": false,
+      "progress": [
+        "1280/1280"
+      ]
+    },
+    {
+      "ready": true,
+      "operation": "get",
+      "objects": 1280,
+      "bytes": 3964744609,
+      "seconds": 2.75147,
+      "effective_gbps": 11.5276,
+      "pool_bytes": 17179869184,
+      "slot_bytes": 3145728,
+      "queue_depth": 32,
+      "device": "mlx5_0",
+      "persistent_qp": true,
+      "one_sided": true,
+      "remote_disk_io": false,
+      "gpudirect_claimed": false,
+      "progress": [
+        "1280/1280"
+      ]
+    }
+  ]
+}

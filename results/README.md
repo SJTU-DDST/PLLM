@@ -18,3 +18,9 @@
   changing from OOM while resident to success after PLLM Level 2.
 - `nemotron_calibration.json` is the Level 2 cost profile derived from the live
   segmented sleep/reload/wake measurement.
+- `rdma_memory_pool_live_put_sharded.json` and
+  `rdma_memory_pool_live_get_sharded.json` record the 75-to-71 four-QP volatile
+  pool run over 15,858,978,307 bytes of real runtime-expert objects. Their
+  primary metrics are process-level wall time: 2.545s PUT and 4.012s GET.
+- The cross-host pool files are protocol-v1 evidence. Local v2 smoke results
+  must not be used to claim a cross-host speedup until the same profile is rerun.

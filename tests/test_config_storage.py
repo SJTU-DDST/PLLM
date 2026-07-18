@@ -27,10 +27,31 @@ def test_config_round_trip(tmp_path: Path) -> None:
     assert loaded.expert_auto_resize_enabled is False
 
 
-def test_runtime_dir_falls_back_when_configured_directory_is_missing(
+def test_runtime_dir_uses_system_runtime_when_configured_directory_is_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing"
+    system_runtime = Path(f"/run/user/{os.getuid()}")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(missing))
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        lambda path: path == system_runtime,
+    )
+    monkeypatch.setattr(
+        os,
+        "access",
+        lambda path, mode: Path(path) == system_runtime,
+    )
+
+    assert pllm_runtime_dir() == system_runtime
+
+
+def test_runtime_dir_falls_back_to_tmp_when_runtime_directories_are_missing(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
+    monkeypatch.setattr(Path, "is_dir", lambda path: False)
 
     assert pllm_runtime_dir() == Path("/tmp") / f"pllm-{os.getuid()}"
 

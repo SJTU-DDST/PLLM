@@ -76,7 +76,7 @@ Agent 每 250ms 融合：
 
 输出不是一个简单阈值，而是前台资源包络：容量 `R`、释放 deadline `D`、可用数据移动带宽 `B`、后台 compute duty cycle `C` 和预计持续时间 `H`。自然语言策略如“Blender 渲染时优先释放 40GB”只能编译成这些受限字段，最后由白名单 policy guard 执行。
 
-### 4.2 Exact Elastic Expert Residency
+### 4.2 Route-Preserving Elastic Expert Residency
 
 本地 checkpoint 静态分析显示：
 
@@ -96,7 +96,7 @@ predict -> async prefetch -> actual Top-22 route
                          -> miss: load exact expert and stall
 ```
 
-系统不使用错误 expert，不修改 Top-k，不做 cache-aware rerouting。Conformal-style calibration 只用于控制 held-out trace 上的边际 miss 风险；prompt/domain 漂移时必须扩大集合或退出 elastic mode。
+系统不使用错误 expert，不修改 Top-k，不做 cache-aware rerouting。当前证据只支持“actual route 不被 predictor 替代”，不支持跨独立请求的逐 token 等价。Conformal-style calibration 只用于控制 held-out trace 上的边际 miss 风险；prompt/domain 漂移时必须扩大集合或退出 elastic mode。
 
 动态 resident budget 不是孤立 cache 参数。控制器同时选择：
 
@@ -140,7 +140,12 @@ expert/model slots in UMA
         <-> remote host memory over ConnectX-7
 ```
 
-Spark 不支持 GPUDirect RDMA。当前独立 bridge 的远端路径固定为 `CX-7 -> registered host buffer -> local SSD atomic cache -> checked Python buffer -> CUDA/UMA slot`，并查询 capability 阻止错误 GDR 声明。它不是 NIC 直达 GPU，也不是零拷贝；NVMe 和 RDMA 共用前台感知 I/O governor，因为两者最终都会消耗本地存储和 UMA 带宽。未来 in-process `cudaHostAlloc` staging 可以移除本地 SSD 往返，但不属于本轮实现。
+Spark 不支持 GPUDirect RDMA。PLLM 因此实现两条语义不同的 host-staged 路径：
+
+- durable object store：`CX-7 -> registered host buffer -> local SSD atomic cache -> checked Python buffer -> CUDA/UMA slot`，提供 checksum、manifest 和落盘语义；
+- volatile remote pool：71 预注册大块 host MR，75 以持久 RC QP 执行 one-sided PUT/GET，71 CPU 与文件系统不进入数据热路径。
+
+当前 volatile GET 仍先写 75 本地 `.pllmex`，再由 Python/CUDA loader 入 slot，因此不是 NIC 直达 GPU，也不是零拷贝。两条路径均受前台感知 I/O governor 限制；直接 pinned-staging-to-slot 是下一阶段的性能工作。
 
 Level 2 恢复直接读取共享模型 checkpoint，不在每次休眠时写出第二份 75GiB 权重。`fastsafetensors`、multithread safetensors 和未来 expert-object loader 的 transform 时间与 I/O 时间分别记录。
 
@@ -191,13 +196,15 @@ PLLM 不以 router prediction 替代真实 routing。Prediction set 只决定提
 
 ### 已在真实模型/硬件上验证
 
-- 完整回归 `55 passed`，CMake、compileall 和 shell syntax 通过；
+- 完整回归 `63 passed`，CMake、compileall 和 shell syntax 通过；
 - 完整导出 20,480 个 Marlin runtime experts、约 60GiB，跨 40 层抽样 checksum 全部通过；
 - 128-slot ModelOpt NVFP4/Marlin EER 启动、actual Top-22 blocking load 和真实生成；
 - vLLM Level 1/2 与 PLLM API hibernate/wake；Level 2 在 0.131--0.185s 回收约 43--44GiB；
 - 恢复后真实 OpenAI proxy 请求 HTTP 200，但本地恢复约 39--42s，冷槽请求约 33s；
 - 60GiB 前台 CUDA allocation 从模型常驻 OOM 变为休眠后成功；
 - 20MiB RC RDMA PUT/GET integrity、token/path guard、Python store 与 15MiB live-state carrier；
+- 75→71 的 4-QP volatile pool 搬运 5,120 个真实 runtime expert objects（15.859GB）：PUT wall 2.545s（49.85Gb/s），GET 到本地文件 wall 4.012s（31.62Gb/s）；
+- Blender 5.2 OptiX 场景、GNOME focus PID 与 PLLM workload input 链路；当前只有预览，没有 QoS 对照；
 - 实时 NVML/EER API、SSE、Vue 桌面/移动界面与 PySide6 悬浮窗。
 
 ### 已实现但只具部分证据
@@ -211,11 +218,12 @@ PLLM 不以 router prediction 替代真实 routing。Prediction set 只决定提
 ### 仍待完成
 
 - 真实 route tracer、predictor calibration、online drift detector 与 EER baseline matrix；
-- 独立双机 RDMA bandwidth 和 DGX Spark ConnectX-7/UMA 测试；
+- 优化后 volatile-pool v2 的跨机复测、direct RDMA-to-slot 与同 profile NVMe 基线；
+- DGX Spark ConnectX-7/UMA 测试；
 - Blender、游戏、NVENC 的真实 throughput/jank/energy；
 - NemotronH Mamba/KV/RNG restore 与 greedy token equality。
 
-MR staging copy 与网络 bandwidth 继续分开报告；当前 RC loopback 只证明 QP/MR/PUT/GET 数据语义，不提供双机吞吐结论。详细结果见 `docs/实验报告.md`。
+MR staging copy、纯 verbs phase 与调用者 wall time 继续分开报告。跨机结果来自优化前协议 v1；selective-signaling/inline-header/read-depth-16 的 v2 只完成 124MB 本机 RoCE smoke test，不以本机 94.0/79.1Gb/s 替代跨机复测。详细结果见 `docs/实验报告.md`。
 
 ## 8. 实验计划
 

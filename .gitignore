@@ -10,6 +10,8 @@ dist/
 .vscode/
 cufile.log
 results/*.json
+!results/rdma_memory_pool_live_put_sharded.json
+!results/rdma_memory_pool_live_get_sharded.json
 results/*.csv
 results/*.png
 results/eer-memory-*.tsv
