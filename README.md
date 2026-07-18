@@ -142,7 +142,7 @@ python scripts/rdma_benchmark.py --allocator aligned --device mlx5_0
 pytest
 ```
 
-- 完整回归为 `63 passed`；compileall、shell syntax 和 CMake 构建通过。
+- 完整回归为 `69 passed`；compileall、shell syntax 和 CMake 构建通过。
 - 真实 Level 2 在 0.131--0.185 秒回收约 43--44GiB，恢复约 39--42 秒；恢复后代理请求 HTTP 200。
 - 60GiB CUDA allocation 从模型常驻 OOM 变为 Level 2 后成功；该结果是显存 admission，不是游戏或 Blender 吞吐。
 - `mlx5_0` 真实完成 20MiB durable RC RDMA PUT/GET；75→71 volatile pool 以 4 QP 搬运 15.859GB profile。后者是 host-memory transport，不是 GDR 或已完成的模型恢复。
@@ -160,6 +160,7 @@ pytest
 - [暂停恢复调研](docs/主流推理框架暂停恢复调研.md)
 - [部署说明](docs/部署说明.md)
 - [实验报告](docs/实验报告.md)
+- [LongBench QA 开关 PLLM 对照实验](docs/LongBench-QA开关PLLM实验.md)
 - [数据面实现与待验收说明](docs/数据面实现与待验收说明.md)
 - [数据面三轮审稿与答辩](docs/reviews/dataplane-implementation/round-1-review.md)
 - [当前实现三轮论文修订](docs/reviews/iteration-4/README.md)

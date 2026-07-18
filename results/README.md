@@ -24,3 +24,10 @@
   primary metrics are process-level wall time: 2.545s PUT and 4.012s GET.
 - The cross-host pool files are protocol-v1 evidence. Local v2 smoke results
   must not be used to claim a cross-host speedup until the same profile is rerun.
+- `qa_benchmark/native_full/` contains all 150 per-sample MQA/NQA/TQA
+  predictions and the aggregate full-resident baseline. `qa_benchmark/pllm_eer128/`
+  and `qa_benchmark/pllm_eer256/` are censored release-capable trials, not zero-F1
+  completed runs. `qa_benchmark/pllm_full_sleep_startup_failure.json` records the
+  full-resident Sleep Mode initialization OOM.
+- `qa_benchmark/experiment_matrix.json` is the compact machine-readable index.
+  It uses JSON `null` for quality metrics from startup failures and censored runs.
