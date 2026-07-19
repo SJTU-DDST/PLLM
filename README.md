@@ -123,9 +123,13 @@ python scripts/benchmark_continuity.py --level 1 --pause-seconds 300 \
 python scripts/benchmark_host_moe_resume.py \
   --pause-seconds 300 --pressure-gib 60 \
   --output-dir exp/host_moe_resume
+
+python scripts/benchmark_ssd_moe_resume.py \
+  --pause-seconds 300 --pressure-gib 60 \
+  --output-dir exp/ssd_moe_resume
 ```
 
-独显且主存宽裕时，5 分钟窗口推荐 Level 1 + active-block SSD + Recent-32；主存也要让给其他工作时使用 Level 2。host-memory MoE priority-copy 的 allocator-level 基准比朴素 full-copy 快 24.57%（K=256 p50），K=320 在 p95 miss 下仍快 10.41%；该路径尚未接入完整模型 wake。完整设计、失败实验和图表见 [`pref.md`](pref.md)。
+独显且主存宽裕时，5 分钟窗口推荐 Level 1 + active-block SSD + Recent-32；主存也要让给其他工作时使用 Level 2。DGX Spark/UMA 上 host backup 不释放统一内存容量，推荐 Level 2 + Recent-32 SSD hot-pack。host-memory priority-copy 基准快 24.57%；本机 SSD hot-pack routed-expert 冷恢复从 56.53 秒降到 21.86 秒（2.59x），但两者尚未接入完整模型 wake。完整设计、失败实验和图表见 [`pref.md`](pref.md)。
 
 ## RDMA 数据面
 
@@ -165,7 +169,7 @@ python scripts/rdma_benchmark.py --allocator aligned --device mlx5_0
 pytest
 ```
 
-- 完整回归为 `127 passed, 4 skipped`（131 collected）；compileall 和 shell syntax 通过。
+- 完整回归为 `130 passed, 4 skipped`（134 collected）；compileall 和 shell syntax 通过。
 - 早期 native Level 2 在 0.131--0.185 秒回收约 43--44GiB、恢复约 39--42 秒；本次 EER 380-slot 因完整 74.80GiB checkpoint reload，恢复更慢，见下方 5 分钟结果。
 - 60GiB CUDA allocation 从模型常驻 OOM 变为 Level 2 后成功；该结果是显存 admission，不是游戏或 Blender 吞吐。
 - `mlx5_0` 真实完成 20MiB durable RC RDMA PUT/GET；75→71 的 64GiB warm image 与 direct shared host-MR GET 已跨机实测。终点是 host memory，不是 GDR 或已完成的 GPU slot refill。
@@ -176,6 +180,7 @@ pytest
 - 5 分钟真实 EER 380-slot：Level 2 固定等待外关键路径 218.87 秒；Level 1 为 89.62 秒，缩短 59.05%，两者均释放约 62.6--62.7GiB GPU 空间并容纳 60GiB 本机竞争 allocation。
 - Level 1 备份 54.84GiB 权重到 host；Level 2 的 148.80 秒全 checkpoint reload 是当前最大瓶颈。跳过 connector quiesce 保留 CPU primary 会触发 vLLM invariant，已否决。
 - 同一 54.84GiB size-matched pinned host carrier 上，Recent-32 K=256 + exact miss fallback 把首个可执行 route 的物理 H2D 从 1.0476 秒降到 0.7902 秒（24.57%）；K=320 的 p95 路径仍缩短 10.41%。这是 selective-wake 基准，不是完整模型 TTFT 声明。
+- 本机 NVMe 上，20,480-file 朴素 routed-expert 冷恢复为 56.53 秒；连续布局为 44.52 秒，Recent-32 K=256 hot-pack 为 21.86 秒。pack 构建 82.49 秒，可藏入 5 分钟窗口；结果不含 dense/router/shared，也不是 DGX 实机 TTFT。
 
 ## 文档
 
