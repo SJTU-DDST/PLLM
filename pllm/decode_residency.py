@@ -110,6 +110,9 @@ class DecodeRouteWindow:
         self._current: dict[int, list[tuple[int, ...]]] = {
             layer: [] for layer in self.layers
         }
+        self._recent: dict[int, deque[tuple[int, ...]]] = {
+            layer: deque(maxlen=self.window_steps) for layer in self.layers
+        }
         self._prefill_tail: dict[int, deque[tuple[int, ...]]] = {
             layer: deque(maxlen=min(16, self.window_steps)) for layer in self.layers
         }
@@ -137,6 +140,7 @@ class DecodeRouteWindow:
                 self._route_generation += 1
                 for layer in self.layers:
                     self._current[layer].clear()
+                    self._recent[layer].clear()
                     self._prediction_counts[layer].clear()
                     self._prediction_recency[layer].clear()
                     self._validation[layer].clear()
@@ -211,6 +215,7 @@ class DecodeRouteWindow:
                     self._prefill_counts[layer].update(row)
 
     def _observe_decode_row(self, layer: int, row: tuple[int, ...]) -> None:
+        self._recent[layer].append(row)
         current = self._current[layer]
         current.append(row)
         if len(current) >= self.window_steps:
@@ -253,7 +258,23 @@ class DecodeRouteWindow:
         self._completed_windows[layer] += 1
         self._route_generation += 1
 
-    def hot_experts(self, layer: int, limit: int) -> list[int]:
+    def recent_experts(self, layer: int, steps: int) -> list[int]:
+        if steps <= 0:
+            return []
+        with self._lock:
+            recent: list[int] = []
+            seen: set[int] = set()
+            rows = list(self._recent.get(int(layer), ()))
+            for row in reversed(rows[-int(steps) :]):
+                for expert in row:
+                    if expert not in seen:
+                        recent.append(expert)
+                        seen.add(expert)
+            return recent
+
+    def hot_experts(
+        self, layer: int, limit: int, pin_recent_steps: int = 0
+    ) -> list[int]:
         if limit <= 0:
             return []
         with self._lock:
@@ -269,7 +290,9 @@ class DecodeRouteWindow:
                     expert,
                 ),
             )
-            return ranking[: min(int(limit), self.experts_per_layer)]
+            pinned = self.recent_experts(layer, pin_recent_steps)
+            selected = pinned + [expert for expert in ranking if expert not in pinned]
+            return selected[: min(int(limit), self.experts_per_layer)]
 
     def _rank_counts(self, layer: int, counts: Counter[int]) -> list[int]:
         prefill_counts = self._prefill_counts.get(layer, Counter())
@@ -951,6 +974,7 @@ class DecodeCacheSimulation:
     miss_bytes: int
     misses_per_token_p50: float
     misses_per_token_p95: float
+    protect_recent_tokens: int = 0
     exact_route_preserved: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -965,12 +989,21 @@ def simulate_decode_cache(
     policy: str = "lru",
     history_window: int = 64,
     experts_per_layer: int | None = None,
+    protect_recent_tokens: int = 0,
 ) -> DecodeCacheSimulation:
     """Replay real route arrays without executing or approximating experts."""
     if policy not in {"lru", "window_lfu"}:
         raise ValueError("policy must be lru or window_lfu")
-    if slots_per_layer <= 0 or expert_bytes <= 0 or history_window <= 0:
-        raise ValueError("slots, expert bytes, and history window must be positive")
+    if (
+        slots_per_layer <= 0
+        or expert_bytes <= 0
+        or history_window <= 0
+        or protect_recent_tokens < 0
+    ):
+        raise ValueError(
+            "slots, expert bytes, and history window must be positive; "
+            "recent protection must be non-negative"
+        )
     if getattr(decode_routes, "ndim", 0) != 3:
         raise ValueError("decode_routes must have shape [tokens, layers, top_k]")
     if getattr(prefill_tail, "ndim", 0) != 3:
@@ -1028,6 +1061,10 @@ def simulate_decode_cache(
                 raise ValueError("one exact Top-k route exceeds the physical slot count")
             cache = caches[layer]
             protected = set(actual)
+            preferred = set(protected)
+            if protect_recent_tokens:
+                for recent_row in list(windows[layer])[-protect_recent_tokens:]:
+                    preferred.update(recent_row)
             accesses += len(actual)
             for expert in actual:
                 if expert in cache:
@@ -1036,7 +1073,11 @@ def simulate_decode_cache(
                     misses += 1
                     token_misses += 1
                     if len(cache) >= slots_per_layer:
-                        candidates = [item for item in cache if item not in protected]
+                        candidates = [item for item in cache if item not in preferred]
+                        if not candidates and preferred != protected:
+                            candidates = [
+                                item for item in cache if item not in protected
+                            ]
                         if not candidates:
                             raise RuntimeError("no evictable expert remains for exact routing")
                         if policy == "window_lfu":
@@ -1080,4 +1121,5 @@ def simulate_decode_cache(
         miss_bytes=misses * int(expert_bytes),
         misses_per_token_p50=percentile(0.50),
         misses_per_token_p95=percentile(0.95),
+        protect_recent_tokens=int(protect_recent_tokens),
     )

@@ -8,6 +8,7 @@ build/
 dist/
 .idea/
 .vscode/
+.venv/
 cufile.log
 results/*.json
 !results/rdma_memory_pool_live_put_sharded.json

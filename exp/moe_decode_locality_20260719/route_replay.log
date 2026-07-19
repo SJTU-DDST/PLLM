@@ -1,0 +1,313 @@
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[mqa] 1/20 status=ok f1=1.0000
+[mqa] 2/20 status=ok f1=0.3333
+[mqa] 3/20 status=ok f1=1.0000
+[mqa] 4/20 status=ok f1=0.5263
+[mqa] 5/20 status=ok f1=0.4828
+[mqa] 6/20 status=ok f1=0.4444
+[mqa] 7/20 status=ok f1=0.5600
+[mqa] 8/20 status=ok f1=1.0000
+[mqa] 9/20 status=ok f1=0.0000
+[mqa] 10/20 status=ok f1=0.7500
+[mqa] 11/20 status=ok f1=0.1000
+[mqa] 12/20 status=ok f1=1.0000
+[mqa] 13/20 status=ok f1=0.9412
+[mqa] 14/20 status=ok f1=0.3333
+[mqa] 15/20 status=ok f1=1.0000
+[mqa] 16/20 status=ok f1=1.0000
+[mqa] 17/20 status=ok f1=0.3636
+[mqa] 18/20 status=ok f1=0.2857
+[mqa] 19/20 status=ok f1=0.1818
+[mqa] 20/20 status=ok f1=0.0000
+[nqa] 1/20 status=ok f1=0.1000
+[nqa] 2/20 status=ok f1=0.0000
+[nqa] 3/20 status=ok f1=0.2000
+[nqa] 4/20 status=ok f1=0.2105
+[nqa] 5/20 status=ok f1=0.1429
+[nqa] 6/20 status=ok f1=0.6667
+[nqa] 7/20 status=ok f1=0.4000
+[nqa] 8/20 status=ok f1=0.8000
+[nqa] 9/20 status=ok f1=0.0000
+[nqa] 10/20 status=ok f1=0.6667
+[nqa] 11/20 status=ok f1=0.1538
+[nqa] 12/20 status=ok f1=0.0000
+[nqa] 13/20 status=ok f1=0.5000
+[nqa] 14/20 status=ok f1=0.8000
+[nqa] 15/20 status=ok f1=0.6667
+[nqa] 16/20 status=ok f1=0.0000
+[nqa] 17/20 status=ok f1=0.0000
+[nqa] 18/20 status=ok f1=0.0000
+[nqa] 19/20 status=ok f1=0.7500
+[nqa] 20/20 status=ok f1=0.0000
+[tqa] 1/20 status=ok f1=0.1333
+[tqa] 2/20 status=ok f1=0.2353
+[tqa] 3/20 status=ok f1=0.1538
+[tqa] 4/20 status=ok f1=0.3333
+[tqa] 5/20 status=ok f1=0.3333
+[tqa] 6/20 status=ok f1=0.4444
+[tqa] 7/20 status=ok f1=0.3077
+[tqa] 8/20 status=ok f1=0.1333
+[tqa] 9/20 status=ok f1=0.2000
+[tqa] 10/20 status=ok f1=0.1538
+[tqa] 11/20 status=ok f1=0.5000
+[tqa] 12/20 status=ok f1=0.2500
+[tqa] 13/20 status=ok f1=0.4000
+[tqa] 14/20 status=ok f1=0.1818
+[tqa] 15/20 status=ok f1=0.3333
+[tqa] 16/20 status=ok f1=0.2857
+[tqa] 17/20 status=ok f1=0.0000
+[tqa] 18/20 status=ok f1=0.5000
+[tqa] 19/20 status=ok f1=0.3333
+[tqa] 20/20 status=ok f1=0.2500
+{
+  "completed_samples": 60,
+  "errors": 0,
+  "f1": 0.3803736013422146,
+  "wall_request_seconds": 68.44005864998326,
+  "prompt_tokens": 427049,
+  "completion_tokens": 1093,
+  "captured_decode_tokens": 1033,
+  "route_file_bytes": 11358168,
+  "simulations": {
+    "lru:384": {
+      "policy": "lru",
+      "slots_per_layer": 384,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 838400,
+      "blocking_misses": 70640,
+      "byte_hit_rate": 0.9222916483323066,
+      "miss_gib": 203.72053503990173,
+      "network_seconds_lower_bound": 101.86026751995087,
+      "misses_per_token": 68.38334946757018,
+      "estimated_miss_ms_per_token": 512.8751210067763,
+      "estimated_slowdown_ratio": 6.1287512100677635,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:416": {
+      "policy": "lru",
+      "slots_per_layer": 416,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 857283,
+      "blocking_misses": 51757,
+      "byte_hit_rate": 0.943064111590249,
+      "miss_gib": 149.26335974037647,
+      "network_seconds_lower_bound": 74.63167987018824,
+      "misses_per_token": 50.103581800580834,
+      "estimated_miss_ms_per_token": 375.77686350435624,
+      "estimated_slowdown_ratio": 4.757768635043562,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:448": {
+      "policy": "lru",
+      "slots_per_layer": 448,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 874926,
+      "blocking_misses": 34114,
+      "byte_hit_rate": 0.9624724984599138,
+      "miss_gib": 98.38225272297859,
+      "network_seconds_lower_bound": 49.191126361489296,
+      "misses_per_token": 33.02420135527589,
+      "estimated_miss_ms_per_token": 247.6815101645692,
+      "estimated_slowdown_ratio": 3.4768151016456925,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:464": {
+      "policy": "lru",
+      "slots_per_layer": 464,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 883508,
+      "blocking_misses": 25532,
+      "byte_hit_rate": 0.9719132271407199,
+      "miss_gib": 73.63239949941635,
+      "network_seconds_lower_bound": 36.816199749708176,
+      "misses_per_token": 24.716360116166506,
+      "estimated_miss_ms_per_token": 185.37270087124878,
+      "estimated_slowdown_ratio": 2.853727008712488,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:480": {
+      "policy": "lru",
+      "slots_per_layer": 480,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 891951,
+      "blocking_misses": 17089,
+      "byte_hit_rate": 0.9812010472586464,
+      "miss_gib": 49.283411994576454,
+      "network_seconds_lower_bound": 24.641705997288227,
+      "misses_per_token": 16.543078412391093,
+      "estimated_miss_ms_per_token": 124.0730880929332,
+      "estimated_slowdown_ratio": 2.2407308809293323,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:496": {
+      "policy": "lru",
+      "slots_per_layer": 496,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 900424,
+      "blocking_misses": 8616,
+      "byte_hit_rate": 0.9905218692246766,
+      "miss_gib": 24.847906708717346,
+      "network_seconds_lower_bound": 12.423953354358673,
+      "misses_per_token": 8.340755082284607,
+      "estimated_miss_ms_per_token": 62.55566311713456,
+      "estimated_slowdown_ratio": 1.6255566311713456,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:504": {
+      "policy": "lru",
+      "slots_per_layer": 504,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 904730,
+      "blocking_misses": 4310,
+      "byte_hit_rate": 0.9952587344891314,
+      "miss_gib": 12.42972120642662,
+      "network_seconds_lower_bound": 6.21486060321331,
+      "misses_per_token": 4.172313649564376,
+      "estimated_miss_ms_per_token": 31.292352371732818,
+      "estimated_slowdown_ratio": 1.3129235237173282,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "lru:512": {
+      "policy": "lru",
+      "slots_per_layer": 512,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 909040,
+      "blocking_misses": 0,
+      "byte_hit_rate": 1.0,
+      "miss_gib": 0.0,
+      "network_seconds_lower_bound": 0.0,
+      "misses_per_token": 0.0,
+      "estimated_miss_ms_per_token": 0.0,
+      "estimated_slowdown_ratio": 1.0,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:384": {
+      "policy": "window_lfu",
+      "slots_per_layer": 384,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 844230,
+      "blocking_misses": 64810,
+      "byte_hit_rate": 0.928705007480419,
+      "miss_gib": 186.9072462618351,
+      "network_seconds_lower_bound": 93.45362313091755,
+      "misses_per_token": 62.73959341723136,
+      "estimated_miss_ms_per_token": 470.54695062923525,
+      "estimated_slowdown_ratio": 5.705469506292352,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:416": {
+      "policy": "window_lfu",
+      "slots_per_layer": 416,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 863247,
+      "blocking_misses": 45793,
+      "byte_hit_rate": 0.9496248789932237,
+      "miss_gib": 132.06362487375736,
+      "network_seconds_lower_bound": 66.03181243687868,
+      "misses_per_token": 44.33010648596321,
+      "estimated_miss_ms_per_token": 332.4757986447241,
+      "estimated_slowdown_ratio": 4.324757986447241,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:448": {
+      "policy": "window_lfu",
+      "slots_per_layer": 448,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 880188,
+      "blocking_misses": 28852,
+      "byte_hit_rate": 0.9682610226172665,
+      "miss_gib": 83.20703393220901,
+      "network_seconds_lower_bound": 41.60351696610451,
+      "misses_per_token": 27.93030009680542,
+      "estimated_miss_ms_per_token": 209.47725072604067,
+      "estimated_slowdown_ratio": 3.094772507260407,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:464": {
+      "policy": "window_lfu",
+      "slots_per_layer": 464,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 887867,
+      "blocking_misses": 21173,
+      "byte_hit_rate": 0.9767083956701575,
+      "miss_gib": 61.06136591732502,
+      "network_seconds_lower_bound": 30.53068295866251,
+      "misses_per_token": 20.496611810261374,
+      "estimated_miss_ms_per_token": 153.72458857696031,
+      "estimated_slowdown_ratio": 2.537245885769603,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:480": {
+      "policy": "window_lfu",
+      "slots_per_layer": 480,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 895226,
+      "blocking_misses": 13814,
+      "byte_hit_rate": 0.9848037490099446,
+      "miss_gib": 39.83855423331261,
+      "network_seconds_lower_bound": 19.919277116656303,
+      "misses_per_token": 13.37270087124879,
+      "estimated_miss_ms_per_token": 100.29525653436592,
+      "estimated_slowdown_ratio": 2.0029525653436595,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:496": {
+      "policy": "window_lfu",
+      "slots_per_layer": 496,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 902240,
+      "blocking_misses": 6800,
+      "byte_hit_rate": 0.9925195810965414,
+      "miss_gib": 19.610697031021118,
+      "network_seconds_lower_bound": 9.805348515510559,
+      "misses_per_token": 6.582768635043562,
+      "estimated_miss_ms_per_token": 49.37076476282672,
+      "estimated_slowdown_ratio": 1.4937076476282671,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:504": {
+      "policy": "window_lfu",
+      "slots_per_layer": 504,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 905687,
+      "blocking_misses": 3353,
+      "byte_hit_rate": 0.9963114934436328,
+      "miss_gib": 9.669803991913795,
+      "network_seconds_lower_bound": 4.834901995956898,
+      "misses_per_token": 3.2458857696030976,
+      "estimated_miss_ms_per_token": 24.344143272023235,
+      "estimated_slowdown_ratio": 1.2434414327202323,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    },
+    "window_lfu:512": {
+      "policy": "window_lfu",
+      "slots_per_layer": 512,
+      "samples": 60,
+      "expert_accesses": 909040,
+      "resident_hits": 909040,
+      "blocking_misses": 0,
+      "byte_hit_rate": 1.0,
+      "miss_gib": 0.0,
+      "network_seconds_lower_bound": 0.0,
+      "misses_per_token": 0.0,
+      "estimated_miss_ms_per_token": 0.0,
+      "estimated_slowdown_ratio": 1.0,
+      "evidence": "offline_replay_of_live_full_resident_routes"
+    }
+  }
+}

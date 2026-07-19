@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-07-19T16:33:40.880565+08:00",
+  "evidence": "live_token_boundary_level0_pause_logical_capacity_wake",
+  "base_url": "http://127.0.0.1:18080",
+  "model": "nvidia/nemotron-3-super",
+  "arms": [
+    "resident_baseline",
+    "pause_only",
+    "pause_evict_368"
+  ],
+  "control_mode": "direct",
+  "residency_mode": "logical",
+  "baseline_slots": 384,
+  "profiles": [
+    384,
+    368
+  ],
+  "rounds": 1,
+  "warmup_rounds": 2,
+  "max_tokens": 32,
+  "trigger_events": 8,
+  "results": [
+    {
+      "status": "ok",
+      "arm": "resident_baseline",
+      "target_slots": 384,
+      "wall_seconds": 9.614526716060936,
+      "response_header_seconds": 0.007008315995335579,
+      "ttft_seconds": 3.2462178990244865,
+      "text_events": 31,
+      "output": "We need to output numbers 1 to 96 separated by single spaces, no extra explanation. Just a line with numbers. Ensure no trailing space? Probably",
+      "all_tpot": {
+        "count": 30,
+        "mean_ms": 208.68378782955307,
+        "p50_ms": 209.9953070282936,
+        "p95_ms": 279.2620691470802
+      },
+      "pre_transition_tpot": {
+        "count": 30,
+        "mean_ms": 208.68378782955307,
+        "p50_ms": 209.9953070282936,
+        "p95_ms": 279.2620691470802
+      },
+      "post_transition_tpot": {
+        "count": 0,
+        "mean_ms": null,
+        "p50_ms": null,
+        "p95_ms": null
+      },
+      "transition_gap_ms": null,
+      "transition": null,
+      "memory_before_request_mib": 66144.0,
+      "memory_after_request_mib": 66144.0,
+      "counter_delta": {
+        "hits": 42083,
+        "misses": 1220,
+        "evictions": 1220,
+        "bytes_loaded": 3777832480,
+        "load_time_ns": 4922165001,
+        "resize_count": 0,
+        "resize_time_ns": 0,
+        "gpu_copy_bytes": 0,
+        "batch_loads": 254,
+        "batch_objects": 1220,
+        "capacity_change_count": 0,
+        "capacity_change_time_ns": 0
+      },
+      "runtime_after": {
+        "slots_per_layer": 384,
+        "route_trace": {
+          "phase": "idle",
+          "phase_changed_at": 1784450067.3869941,
+          "window_steps": 256,
+          "decode_observations": 1200,
+          "decode_token_rows": 1200,
+          "decode_layer_rows_retained": 1200,
+          "prefill_layer_rows_retained": 480,
+          "projected_byte_hit_rate": {
+            "64": 0.67178,
+            "128": 0.864773,
+            "256": 0.982917,
+            "320": 0.997917,
+            "384": 1.0,
+            "448": 1.0,
+            "480": 1.0,
+            "496": 1.0,
+            "504": 1.0,
+            "512": 1.0
+          },
+          "storage": "cpu_ring",
+          "gpu_persistent_bytes": 0,
+          "evidence": "runtime_actual_topk_union_per_layer_step"
+        },
+        "state_island": {
+          "attached": true,
+          "tensor_count": 88,
+          "storage_count": 8,
+          "allocated_bytes": 8114405376,
+          "allocation_fingerprint": "9e6f5bc2a7357a864ef429e1ebdd640d5ddb4fe76796cc61af0345e41872a47d",
+          "copy_bytes": 0,
+          "scope": "attention_kv_and_mamba_conv_ssm_allocations",
+          "resize_guard": {
+            "checked": false,
+            "preserved": null
+          }
+        }
+      },
+      "round": 1
+    },
+    {
+      "status": "ok",
+      "arm": "pause_only",
+      "target_slots": 384,
+      "wall_seconds": 9.237052429933101,
+      "response_header_seconds": 0.005048034014180303,
+      "ttft_seconds": 3.052863162010908,
+      "text_events": 30,
+      "output": "We need to output numbers 1 to 96 separated by single spaces, no extra explanation. Just a line with numbers. Ensure no trailing space? Probably",
+      "all_tpot": {
+        "count": 29,
+        "mean_ms": 209.26933900196235,
+        "p50_ms": 204.81610391288996,
+        "p95_ms": 267.2095410525799
+      },
+      "pre_transition_tpot": {
+        "count": 7,
+        "mean_ms": 210.99749999120831,
+        "p50_ms": 205.34761901944876,
+        "p95_ms": 237.98499093391
+      },
+      "post_transition_tpot": {
+        "count": 21,
+        "mean_ms": 208.47469552730522,
+        "p50_ms": 203.6234219558537,
+        "p95_ms": 267.2095410525799
+      },
+      "transition_gap_ms": 213.85972504504025,
+      "transition": {
+        "action": "pause_only",
+        "target_slots": 384,
+        "action_seconds": 0.2133368100039661,
+        "memory_pre_resize_mib": 66144.0,
+        "memory_post_resize_mib": 66144.0,
+        "response": {
+          "pause_status": 200,
+          "wake_status": 200
+        }
+      },
+      "memory_before_request_mib": 66144.0,
+      "memory_after_request_mib": 66144.0,
+      "counter_delta": {
+        "hits": 42187,
+        "misses": 1148,
+        "evictions": 1148,
+        "bytes_loaded": 3554878432,
+        "load_time_ns": 4610332365,
+        "resize_count": 0,
+        "resize_time_ns": 0,
+        "gpu_copy_bytes": 0,
+        "batch_loads": 223,
+        "batch_objects": 1148,
+        "capacity_change_count": 0,
+        "capacity_change_time_ns": 0
+      },
+      "runtime_after": {
+        "slots_per_layer": 384,
+        "route_trace": {
+          "phase": "idle",
+          "phase_changed_at": 1784450076.9482741,
+          "window_steps": 256,
+          "decode_observations": 1200,
+          "decode_token_rows": 1200,
+          "decode_layer_rows_retained": 1200,
+          "prefill_layer_rows_retained": 640,
+          "projected_byte_hit_rate": {
+            "64": 0.672121,
+            "128": 0.865114,
+            "256": 0.983182,
+            "320": 0.998068,
+            "384": 1.0,
+            "448": 1.0,
+            "480": 1.0,
+            "496": 1.0,
+            "504": 1.0,
+            "512": 1.0
+          },
+          "storage": "cpu_ring",
+          "gpu_persistent_bytes": 0,
+          "evidence": "runtime_actual_topk_union_per_layer_step"
+        },
+        "state_island": {
+          "attached": true,
+          "tensor_count": 88,
+          "storage_count": 8,
+          "allocated_bytes": 8114405376,
+          "allocation_fingerprint": "9e6f5bc2a7357a864ef429e1ebdd640d5ddb4fe76796cc61af0345e41872a47d",
+          "copy_bytes": 0,
+          "scope": "attention_kv_and_mamba_conv_ssm_allocations",
+          "resize_guard": {
+            "checked": false,
+            "preserved": null
+          }
+        }
+      },
+      "round": 1
+    },
+    {
+      "status": "ok",
+      "arm": "pause_evict_368",
+      "target_slots": 368,
+      "wall_seconds": 9.95804970501922,
+      "response_header_seconds": 0.00629831594415009,
+      "ttft_seconds": 2.9973513658624142,
+      "text_events": 30,
+      "output": "We need to output numbers 1 to 96 separated by single spaces, no extra explanation. Just a line with numbers. Ensure no trailing space? Probably",
+      "all_tpot": {
+        "count": 29,
+        "mean_ms": 236.08555841452343,
+        "p50_ms": 229.982933960855,
+        "p95_ms": 318.8502499833703
+      },
+      "pre_transition_tpot": {
+        "count": 7,
+        "mean_ms": 219.69745002154792,
+        "p50_ms": 222.39049919880927,
+        "p95_ms": 242.66729108057916
+      },
+      "post_transition_tpot": {
+        "count": 21,
+        "mean_ms": 237.60708542318926,
+        "p50_ms": 229.982933960855,
+        "p95_ms": 309.3825520481914
+      },
+      "transition_gap_ms": 318.8502499833703,
+      "transition": {
+        "action": "resize",
+        "target_slots": 368,
+        "action_seconds": 0.31833935901522636,
+        "memory_pre_resize_mib": 66144.0,
+        "memory_post_resize_mib": 66144.0,
+        "response": {
+          "changed_layers": 40,
+          "slots_per_layer": 368,
+          "retain_policy": "decode_hot",
+          "residency_mode": "logical_capacity_no_physical_reclaim",
+          "state_island_guard": {
+            "checked": true,
+            "preserved": true,
+            "before_bytes": 8114405376,
+            "after_bytes": 8114405376,
+            "copy_bytes": 0
+          }
+        }
+      },
+      "memory_before_request_mib": 66144.0,
+      "memory_after_request_mib": 66144.0,
+      "counter_delta": {
+        "hits": 42037,
+        "misses": 1270,
+        "evictions": 1910,
+        "bytes_loaded": 3932661680,
+        "load_time_ns": 5142793906,
+        "resize_count": 0,
+        "resize_time_ns": 0,
+        "gpu_copy_bytes": 0,
+        "batch_loads": 230,
+        "batch_objects": 1270,
+        "capacity_change_count": 40,
+        "capacity_change_time_ns": 42927545
+      },
+      "runtime_after": {
+        "slots_per_layer": 368,
+        "route_trace": {
+          "phase": "idle",
+          "phase_changed_at": 1784450087.263918,
+          "window_steps": 256,
+          "decode_observations": 1200,
+          "decode_token_rows": 1200,
+          "decode_layer_rows_retained": 1200,
+          "prefill_layer_rows_retained": 640,
+          "projected_byte_hit_rate": {
+            "64": 0.672273,
+            "128": 0.864621,
+            "256": 0.982992,
+            "320": 0.998068,
+            "384": 1.0,
+            "448": 1.0,
+            "480": 1.0,
+            "496": 1.0,
+            "504": 1.0,
+            "512": 1.0
+          },
+          "storage": "cpu_ring",
+          "gpu_persistent_bytes": 0,
+          "evidence": "runtime_actual_topk_union_per_layer_step"
+        },
+        "state_island": {
+          "attached": true,
+          "tensor_count": 88,
+          "storage_count": 8,
+          "allocated_bytes": 8114405376,
+          "allocation_fingerprint": "9e6f5bc2a7357a864ef429e1ebdd640d5ddb4fe76796cc61af0345e41872a47d",
+          "copy_bytes": 0,
+          "scope": "attention_kv_and_mamba_conv_ssm_allocations",
+          "resize_guard": {
+            "checked": true,
+            "preserved": true,
+            "before_bytes": 8114405376,
+            "after_bytes": 8114405376,
+            "copy_bytes": 0
+          }
+        }
+      },
+      "round": 1
+    }
+  ],
+  "finished_at": "2026-07-19T16:34:47.818540+08:00"
+}

@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Measure direct shared-MR package parse and host-to-GPU staging"
     )
-    parser.add_argument("--peer", default="192.168.70.71")
+    parser.add_argument("--peer", default=os.getenv("PLLM_EER_RDMA_PEER"))
     parser.add_argument("--port", type=int, default=17902)
     parser.add_argument(
         "--binary", type=Path, default=Path("rdma_bridge/build/pllm-rdma-pool")
@@ -57,6 +58,8 @@ def main() -> int:
         "--output", type=Path, default=Path("results/rdma_to_gpu_pipeline.json")
     )
     args = parser.parse_args()
+    if not args.peer:
+        parser.error("set --peer or PLLM_EER_RDMA_PEER")
     if args.objects <= 0 or not 1 <= args.batch_size <= 32:
         parser.error("objects must be positive and batch size must be within [1, 32]")
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CURRENT_USER="${USER:-$(id -un)}"
+CURRENT_USER="$(id -un)"
 export MODEL_PATH="${MODEL_PATH:-/mnt/ssd-storage/shared_models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4}"
 export PLLM_EER_MODE=export
 export PLLM_VLLM_ENABLE_SLEEP_MODE=0
@@ -20,7 +20,7 @@ cd "${ROOT}"
 MANIFEST="${PLLM_EER_CACHE_DIR}/runtime-manifest.json"
 
 manifest_complete() {
-  python -c 'import json,sys; p=json.load(open(sys.argv[1])); raise SystemExit(0 if p.get("complete") else 1)' "${MANIFEST}" 2>/dev/null
+  "${PLLM_PYTHON:-python3}" -c 'import json,sys; p=json.load(open(sys.argv[1])); raise SystemExit(0 if p.get("complete") else 1)' "${MANIFEST}" 2>/dev/null
 }
 
 setsid bash scripts/run_vllm.sh --enforce-eager "$@" &

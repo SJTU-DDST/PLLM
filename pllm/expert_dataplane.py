@@ -55,6 +55,8 @@ class LayerCounters:
     gpu_copy_bytes: int = 0
     batch_loads: int = 0
     batch_objects: int = 0
+    capacity_change_count: int = 0
+    capacity_change_time_ns: int = 0
 
 
 @dataclass(slots=True)
@@ -63,6 +65,7 @@ class LayerSlotState:
     global_experts: int
     sink: SlotSink
     slots: list[SlotRecord]
+    active_slots: set[int]
     logical_to_slot: dict[int, int] = field(default_factory=dict)
     generation: int = 0
     counters: LayerCounters = field(default_factory=LayerCounters)
@@ -94,6 +97,7 @@ class ExpertSlotDataPlane:
                 global_experts=global_experts,
                 sink=sink,
                 slots=[SlotRecord(slot=index) for index in range(sink.slot_count)],
+                active_slots=set(range(sink.slot_count)),
             )
             self._layers[layer] = state
         if initial_experts:
@@ -116,15 +120,16 @@ class ExpertSlotDataPlane:
         layer: int,
         experts: list[int] | tuple[int, ...] | set[int],
         reason: str = "route_miss",
+        pinned_experts: list[int] | tuple[int, ...] | set[int] = (),
     ) -> dict[int, int]:
         state = self._layer(layer)
         requested = list(dict.fromkeys(int(item) for item in experts))
         if any(item < 0 or item >= state.global_experts for item in requested):
             raise ValueError(f"layer {layer} received an out-of-range expert ID")
-        if len(requested) > len(state.slots):
+        if len(requested) > len(state.active_slots):
             raise RuntimeError(
                 f"layer {layer} needs {len(requested)} experts but has "
-                f"only {len(state.slots)} physical slots"
+                f"only {len(state.active_slots)} active slots"
             )
 
         now = time.monotonic()
@@ -143,12 +148,17 @@ class ExpertSlotDataPlane:
                 state.counters.hits += 1
 
             protected = set(requested)
+            preferred = protected | {
+                int(expert)
+                for expert in pinned_experts
+                if int(expert) in state.logical_to_slot
+            }
             reservations: list[tuple[int, SlotRecord]] = []
             for expert in missing:
                 state.counters.misses += 1
                 if reason == "prefetch":
                     state.counters.prefetches += 1
-                slot = self._select_slot(state, protected)
+                slot = self._select_slot(state, protected, preferred)
                 self._remove_mapping(state, slot)
                 slot.state = SlotState.LOADING
                 slot.logical_expert = expert
@@ -261,6 +271,54 @@ class ExpertSlotDataPlane:
             count += self.evict(layer, list(state.logical_to_slot))
         return count
 
+    def set_capacity(
+        self, layer: int, capacity: int, retain: list[int] | None = None
+    ) -> dict[str, Any]:
+        """Limit cache residency without reallocating model weight tensors."""
+        state = self._layer(layer)
+        if capacity <= 0 or capacity > len(state.slots):
+            raise ValueError("capacity must be within the physical slot range")
+        with state.lock:
+            started = time.perf_counter_ns()
+            requested = list(dict.fromkeys(retain or []))
+            ranked = [
+                expert
+                for expert in requested
+                if expert in state.logical_to_slot
+                and state.slots[state.logical_to_slot[expert]].state == SlotState.READY
+            ]
+            ranked.extend(
+                expert
+                for expert in sorted(
+                    state.logical_to_slot,
+                    key=lambda item: state.slots[
+                        state.logical_to_slot[item]
+                    ].last_used_at,
+                    reverse=True,
+                )
+                if expert not in ranked
+            )
+            retained = ranked[:capacity]
+            retained_slots = {state.logical_to_slot[expert] for expert in retained}
+            for expert in list(state.logical_to_slot):
+                if expert not in retained:
+                    self._remove_mapping(
+                        state, state.slots[state.logical_to_slot[expert]]
+                    )
+            available = [
+                slot.slot for slot in state.slots if slot.slot not in retained_slots
+            ]
+            state.active_slots = retained_slots | set(
+                available[: capacity - len(retained_slots)]
+            )
+            state.generation += 1
+            state.counters.capacity_change_count += 1
+            state.counters.capacity_change_time_ns += (
+                time.perf_counter_ns() - started
+            )
+            state.sink.publish_mapping(dict(state.logical_to_slot), state.generation)
+            return self.layer_status(layer)
+
     def resize(
         self,
         layer: int,
@@ -312,6 +370,7 @@ class ExpertSlotDataPlane:
                     state.slots = [
                         SlotRecord(slot=index) for index in range(slot_count)
                     ]
+                    state.active_slots = set(range(slot_count))
                     now = time.monotonic()
                     for logical, slot_index in mapping.items():
                         slot = state.slots[slot_index]
@@ -330,6 +389,7 @@ class ExpertSlotDataPlane:
                     state.slots = [
                         SlotRecord(slot=index) for index in range(slot_count)
                     ]
+                    state.active_slots = set(range(slot_count))
                     if retained:
                         self.ensure(layer, retained, reason="resize_restore")
                     state.sink.finish_resize()
@@ -369,7 +429,11 @@ class ExpertSlotDataPlane:
     ) -> dict[str, Any]:
         state = self._layer(layer)
         with state.lock:
-            ready = sum(slot.state == SlotState.READY for slot in state.slots)
+            ready = sum(
+                slot.state == SlotState.READY and slot.slot in state.active_slots
+                for slot in state.slots
+            )
+            physical_ready = sum(slot.state == SlotState.READY for slot in state.slots)
             failed = sum(slot.state == SlotState.FAILED for slot in state.slots)
             average_us = (
                 state.counters.load_time_ns / state.counters.misses / 1000
@@ -380,7 +444,9 @@ class ExpertSlotDataPlane:
                 "layer": layer,
                 "global_experts": state.global_experts,
                 "slot_count": len(state.slots),
+                "active_slot_count": len(state.active_slots),
                 "ready_slots": ready,
+                "physical_ready_slots": physical_ready,
                 "failed_slots": failed,
                 "generation": state.generation,
                 "counters": {
@@ -401,17 +467,32 @@ class ExpertSlotDataPlane:
 
     @staticmethod
     def _select_slot(
-        state: LayerSlotState, protected: set[int]
+        state: LayerSlotState,
+        protected: set[int],
+        preferred: set[int] | None = None,
     ) -> SlotRecord:
         for slot in state.slots:
-            if slot.state in {SlotState.EMPTY, SlotState.FAILED}:
+            if (
+                slot.slot in state.active_slots
+                and slot.state in {SlotState.EMPTY, SlotState.FAILED}
+            ):
                 return slot
+        protected_preferred = preferred if preferred is not None else protected
         candidates = [
             slot
             for slot in state.slots
-            if slot.state == SlotState.READY
-            and slot.logical_expert not in protected
+            if slot.slot in state.active_slots
+            and slot.state == SlotState.READY
+            and slot.logical_expert not in protected_preferred
         ]
+        if not candidates and protected_preferred != protected:
+            candidates = [
+                slot
+                for slot in state.slots
+                if slot.slot in state.active_slots
+                and slot.state == SlotState.READY
+                and slot.logical_expert not in protected
+            ]
         if not candidates:
             raise RuntimeError(
                 f"layer {state.layer} has no evictable slot for exact routing"

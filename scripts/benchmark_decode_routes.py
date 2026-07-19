@@ -7,6 +7,7 @@ import io
 import json
 import math
 import statistics
+import sys
 import time
 from collections import Counter
 from datetime import datetime
@@ -16,6 +17,10 @@ from typing import Any
 import numpy as np
 import requests
 from transformers import AutoTokenizer
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from pllm.decode_residency import simulate_decode_cache
 from pllm.expert_catalog import ExpertCatalog
@@ -458,6 +463,7 @@ def summarize(rows: list[dict[str, Any]], profiles: list[int], policies: list[st
             hits = sum(int(item["resident_hits"]) for item in selected)
             misses = sum(int(item["blocking_misses"]) for item in selected)
             miss_bytes = sum(int(item["miss_bytes"]) for item in selected)
+            projection = selected[0] if selected else {}
             simulation_summary[f"{policy}:{slots}"] = {
                 "policy": policy,
                 "slots_per_layer": slots,
@@ -484,6 +490,12 @@ def summarize(rows: list[dict[str, Any]], profiles: list[int], policies: list[st
                     for item in selected
                 )
                 / max(1, sum(int(item["decode_tokens"]) for item in selected)),
+                "resident_weight_gib": float(
+                    projection.get("resident_weight_gib", 0.0)
+                ),
+                "projected_reclaim_gib": float(
+                    projection.get("projected_reclaim_gib", 0.0)
+                ),
                 "evidence": "offline_replay_of_live_full_resident_routes",
             }
     return {

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
 import threading
@@ -42,18 +43,34 @@ def main() -> int:
     parser.add_argument(
         "--project",
         type=Path,
-        default=Path("/home/cong/hackathon/blender_demo/project/pllm_foreground_demo.blend"),
+        default=(
+            Path(value)
+            if (value := os.getenv("PLLM_BLENDER_PROJECT"))
+            else None
+        ),
     )
     parser.add_argument(
         "--profile-script",
         type=Path,
-        default=Path("/home/cong/hackathon/blender_demo/set_profile.py"),
+        default=(
+            Path(value)
+            if (value := os.getenv("PLLM_BLENDER_PROFILE_SCRIPT"))
+            else None
+        ),
     )
     parser.add_argument("--api-base", default="http://127.0.0.1:17860")
     parser.add_argument("--output-dir", type=Path, default=Path("results/blender_qos"))
     args = parser.parse_args()
-    if not args.project.is_file() or not args.profile_script.is_file():
-        parser.error("Blender project or profile script is missing")
+    if (
+        args.project is None
+        or args.profile_script is None
+        or not args.project.is_file()
+        or not args.profile_script.is_file()
+    ):
+        parser.error(
+            "set --project/PLLM_BLENDER_PROJECT and "
+            "--profile-script/PLLM_BLENDER_PROFILE_SCRIPT to readable files"
+        )
 
     samples: list[dict[str, float]] = []
     stop = threading.Event()

@@ -1,0 +1,28 @@
+{
+  "created_at": 1784463835.600633,
+  "level": 2,
+  "mode": "keep",
+  "pause_at_chunk": 9,
+  "chunks_during_pause": 0,
+  "level_zero_seconds": 0.41032744385302067,
+  "sleep_seconds": 0.18755336082540452,
+  "hold_seconds": 300.0001020799391,
+  "wake_seconds": 147.81488874484785,
+  "wake_to_first_chunk_seconds": null,
+  "stream_finished": true,
+  "stream_error": [
+    "'choices'"
+  ],
+  "pause_and_restore_seconds": 448.4217421740759,
+  "resume_critical_path_seconds": 147.81488874484785,
+  "prompt_characters": 29657,
+  "hibercache_files_before": 7,
+  "hibercache_files_after": 7,
+  "hibercache_bytes_before": 103811344,
+  "hibercache_bytes_after": 103811344,
+  "baseline_characters": 310,
+  "resumed_characters": 50,
+  "exact_match": false,
+  "baseline_sha256": "2d368e9dd74f04713545593ca054dfc865dc2c264c3b08abc8dfc43535068b09",
+  "resumed_sha256": "0312989c7b62ed0448884c4065e64ea831e586bd11d64671964603ca9a9d660d"
+}

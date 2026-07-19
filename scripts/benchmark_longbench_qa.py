@@ -19,12 +19,14 @@ from typing import Any
 
 import requests
 
+from pllm.config import DEFAULT_EXPERT_CACHE_DIR
+
 
 DEFAULT_MODEL = "nvidia/nemotron-3-super"
 DEFAULT_MODEL_PATH = Path(
     "/mnt/ssd-storage/shared_models/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 )
-DEFAULT_EXPERT_PATH = Path("/mnt/ssd-storage/cong/pllm-experts")
+DEFAULT_EXPERT_PATH = DEFAULT_EXPERT_CACHE_DIR
 DEFAULT_HIBERCACHE_PATH = Path("/mnt/ssd-storage/pllm-cache")
 DEFAULT_DATASETS = (
     ("mqa", Path("test_data/mqa.jsonl"), 64),

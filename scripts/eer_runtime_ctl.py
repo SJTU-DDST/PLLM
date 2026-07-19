@@ -16,6 +16,8 @@ def main() -> None:
         choices=(
             "status",
             "resize",
+            "set-capacity",
+            "set-pin-recent-steps",
             "prefetch",
             "evict",
             "evict-all",
@@ -25,13 +27,16 @@ def main() -> None:
     )
     parser.add_argument("--socket", type=Path, default=runtime_dir / "pllm-eer.sock")
     parser.add_argument("--slots", type=int, default=128)
+    parser.add_argument("--pin-recent-steps", type=int, default=32)
     parser.add_argument("--layer", type=int)
     parser.add_argument("--experts", default="")
     args = parser.parse_args()
 
     request: dict[str, object] = {"command": args.command.replace("-", "_")}
-    if args.command == "resize":
+    if args.command in {"resize", "set-capacity"}:
         request.update({"slots_per_layer": args.slots, "quiesced": True})
+    if args.command == "set-pin-recent-steps":
+        request["steps"] = args.pin_recent_steps
     if args.command in {"prefetch", "evict"}:
         if args.layer is None:
             parser.error("--layer is required")

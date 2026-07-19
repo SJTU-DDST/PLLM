@@ -290,7 +290,11 @@ def _stream_chat(
                         choice = event["choices"][0]
                         delta = choice.get("delta", {})
                         token_ids = choice.get("token_ids") or []
-                        content = delta.get("content")
+                        content = (
+                            delta.get("content")
+                            or delta.get("reasoning_content")
+                            or delta.get("reasoning")
+                        )
                         if token_ids or content:
                             if not decode_marked:
                                 controller.mark_inference_phase(

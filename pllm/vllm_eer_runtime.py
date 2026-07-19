@@ -171,6 +171,7 @@ class EERRuntimeConfig:
     rdma_pool_index: Path | None
     rdma_cuda_register_staging: bool
     route_window_steps: int
+    pin_recent_steps: int
 
     @classmethod
     def from_environment(cls) -> "EERRuntimeConfig":
@@ -230,6 +231,7 @@ class EERRuntimeConfig:
                 os.getenv("PLLM_EER_RDMA_CUDA_REGISTER_STAGING", "1") == "1"
             ),
             route_window_steps=int(os.getenv("PLLM_EER_ROUTE_WINDOW_STEPS", "256")),
+            pin_recent_steps=int(os.getenv("PLLM_EER_PIN_RECENT_STEPS", "32")),
         )
 
 
@@ -406,6 +408,20 @@ class TorchMarlinSlotSink:
         return specs
 
 
+def validate_elastic_layer(layer: Any, *, is_reload: bool) -> None:
+    if not is_reload:
+        from vllm.config import get_current_vllm_config
+
+        current = get_current_vllm_config()
+        if current.model_config is not None and not current.model_config.enforce_eager:
+            raise RuntimeError("PLLM EER requires vLLM --enforce-eager")
+    backend = str(layer.quant_method.nvfp4_backend.value).lower()
+    if backend != "marlin":
+        raise RuntimeError(f"PLLM EER requires the Marlin MoE backend, found {backend}")
+    if layer.quant_method.is_monolithic:
+        raise RuntimeError("PLLM EER requires a modular MoE kernel with visible Top-k IDs")
+
+
 class EERRuntime:
     def __init__(self, config: EERRuntimeConfig) -> None:
         self.config = config
@@ -499,6 +515,7 @@ class EERRuntime:
         self.suspended = False
         self.transitioning = False
         self.faulted = False
+        self.pin_recent_steps = config.pin_recent_steps
         self._command_lock = threading.RLock()
         self._control_server: _ThreadedUnixServer | None = None
         self._control_thread: threading.Thread | None = None
@@ -552,18 +569,9 @@ class EERRuntime:
         self._control_thread.start()
 
     def initialize_layer(self, layer: Any) -> None:
-        from vllm.config import get_current_vllm_config
-
         layer_id = _layer_id(layer)
         if self.config.mode == "elastic":
-            current = get_current_vllm_config()
-            if current.model_config is not None and not current.model_config.enforce_eager:
-                raise RuntimeError("PLLM EER requires vLLM --enforce-eager")
-            backend = str(layer.quant_method.nvfp4_backend.value).lower()
-            if backend != "marlin":
-                raise RuntimeError(f"PLLM EER requires the Marlin MoE backend, found {backend}")
-            if layer.quant_method.is_monolithic:
-                raise RuntimeError("PLLM EER requires a modular MoE kernel with visible Top-k IDs")
+            validate_elastic_layer(layer, is_reload=layer_id in self.sinks)
         self.start_control_server()
         sink = TorchMarlinSlotSink(layer, layer_id, self.fingerprint)
         if self.config.mode == "export":
@@ -619,10 +627,18 @@ class EERRuntime:
                 int(item) for row in rows for item in row if int(item) >= 0
             )
         )
+        pinned = self.route_window.recent_experts(
+            layer_id, self.pin_recent_steps
+        )
         if fully_resident:
             return
         load_started = time.perf_counter()
-        self.data_plane.ensure(layer_id, experts, reason="actual_topk")
+        self.data_plane.ensure(
+            layer_id,
+            experts,
+            reason="actual_topk",
+            pinned_experts=pinned,
+        )
         load_ms = (time.perf_counter() - load_started) * 1000.0
         self._record_miss_load(layer_id, len(rows), load_ms)
 
@@ -655,7 +671,7 @@ class EERRuntime:
             self.transitioning = True
             try:
                 result = self._handle_mutating_command(command, request)
-                if command == "resize":
+                if command in {"resize", "set_pin_recent_steps"}:
                     self.faulted = False
                     self.last_error = ""
                 return result
@@ -722,7 +738,9 @@ class EERRuntime:
                     results.append(before)
                     continue
                 retain = (
-                    self.route_window.hot_experts(layer, slots)
+                    self.route_window.hot_experts(
+                        layer, slots, self.pin_recent_steps
+                    )
                     if retain_policy == "decode_hot"
                     else None
                 )
@@ -776,6 +794,54 @@ class EERRuntime:
                 "retain_policy": retain_policy,
                 "state_island_guard": dict(self._last_state_island_guard),
             }
+        if command == "set_capacity":
+            if request.get("quiesced") is not True:
+                raise RuntimeError(
+                    "set_capacity requires a token-boundary quiesced=true guard"
+                )
+            capacity = int(request["slots_per_layer"])
+            retain_policy = str(request.get("retain_policy", "lru"))
+            state_before = self.state_island_status()
+            results = []
+            for layer in self.data_plane.layers():
+                retain = (
+                    self.route_window.hot_experts(
+                        layer, capacity, self.pin_recent_steps
+                    )
+                    if retain_policy == "decode_hot"
+                    else None
+                )
+                results.append(
+                    self.data_plane.set_capacity(layer, capacity, retain=retain)
+                )
+            state_after = self.state_island_status()
+            checked = bool(state_before.get("attached"))
+            preserved = (
+                state_before.get("allocation_fingerprint")
+                == state_after.get("allocation_fingerprint")
+                and state_before.get("allocated_bytes")
+                == state_after.get("allocated_bytes")
+                if checked
+                else None
+            )
+            self._last_state_island_guard = {
+                "checked": checked,
+                "preserved": preserved,
+                "before_bytes": int(state_before.get("allocated_bytes", 0)),
+                "after_bytes": int(state_after.get("allocated_bytes", 0)),
+                "copy_bytes": 0,
+            }
+            if checked and not preserved:
+                raise RuntimeError(
+                    "expert capacity change altered the live KV/Mamba state island"
+                )
+            return {
+                "changed_layers": len(results),
+                "slots_per_layer": capacity,
+                "retain_policy": retain_policy,
+                "residency_mode": "logical_capacity_no_physical_reclaim",
+                "state_island_guard": dict(self._last_state_island_guard),
+            }
         if command == "phase":
             phase = str(request.get("phase", "idle"))
             self.route_window.set_phase(
@@ -784,6 +850,15 @@ class EERRuntime:
             if bool(request.get("reset_decode", False)):
                 self._reset_miss_debt()
             return self.route_window.status()
+        if command == "set_pin_recent_steps":
+            steps = int(request["steps"])
+            if steps < 0 or steps > self.route_window.window_steps:
+                raise ValueError("recent pin steps must fit within the route window")
+            self.pin_recent_steps = steps
+            return {
+                "recent_pin_steps": steps,
+                "route_window_steps": self.route_window.window_steps,
+            }
         if command == "suspend":
             if request.get("quiesced") is not True:
                 raise RuntimeError("suspend requires quiesced=true")
@@ -809,11 +884,17 @@ class EERRuntime:
             and not self.transitioning
             and not self.faulted
         )
-        live_slots = {
+        physical_slots = {
             int(item["slot_count"]) for item in data_plane.get("layers", [])
         }
         slots_by_layer = {
-            str(item["layer"]): int(item["slot_count"])
+            str(item["layer"]): int(
+                item.get("active_slot_count", item["slot_count"])
+            )
+            for item in data_plane.get("layers", [])
+        }
+        active_slots = {
+            int(item.get("active_slot_count", item["slot_count"]))
             for item in data_plane.get("layers", [])
         }
         return {
@@ -828,16 +909,21 @@ class EERRuntime:
             "faulted": self.faulted,
             "model_fingerprint": self.fingerprint,
             "slots_per_layer": (
-                next(iter(live_slots))
-                if len(live_slots) == 1
-                else min(live_slots, default=self.config.slots_per_layer)
+                next(iter(active_slots))
+                if len(active_slots) == 1
+                else min(active_slots, default=self.config.slots_per_layer)
             ),
             "slots_by_layer": slots_by_layer,
             "minimum_slots_per_layer": min(
-                live_slots, default=self.config.slots_per_layer
+                active_slots, default=self.config.slots_per_layer
             ),
             "maximum_slots_per_layer": max(
-                live_slots, default=self.config.slots_per_layer
+                active_slots, default=self.config.slots_per_layer
+            ),
+            "physical_slots_per_layer": (
+                next(iter(physical_slots))
+                if len(physical_slots) == 1
+                else min(physical_slots, default=self.config.slots_per_layer)
             ),
             "cache": self.local_store.status(),
             "rdma": {
@@ -869,6 +955,7 @@ class EERRuntime:
             "data_plane": data_plane,
             "route_trace": self.route_window.status(),
             "miss_debt": self._miss_debt_status(),
+            "recent_pin_steps": self.pin_recent_steps,
             "state_island": self.state_island_status(),
         }
 

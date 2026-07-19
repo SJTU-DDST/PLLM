@@ -124,6 +124,18 @@ def test_route_hit_does_not_republish_an_unchanged_mapping() -> None:
     assert sink.publishes == before
 
 
+def test_recent_pin_avoids_eviction_but_falls_back_for_exact_route() -> None:
+    sink = MemorySink(2)
+    plane = ExpertSlotDataPlane(MemorySource())
+    plane.register_layer(0, 8, sink, initial_experts=[0, 1])
+
+    plane.ensure(0, [2], pinned_experts=[0])
+    assert set(sink.mapping) == {0, 2}
+
+    plane.ensure(0, [3, 4], pinned_experts=[0, 2])
+    assert set(sink.mapping) == {3, 4}
+
+
 def test_resize_reloads_retained_experts_from_backing_store() -> None:
     sink = MemorySink(4)
     plane = ExpertSlotDataPlane(MemorySource())
@@ -187,6 +199,40 @@ def test_destructive_expansion_avoids_dual_allocation_and_reloads_source() -> No
     assert source.reads - reads_before_expand == 4
     assert status["slot_count"] == 4
     assert set(status["logical_to_slot"]) == {0, 1, 2, 3}
+
+
+def test_logical_capacity_evicts_without_reallocating_physical_slots() -> None:
+    source = MemorySource()
+    sink = MemorySink(4)
+    plane = ExpertSlotDataPlane(source)
+    plane.register_layer(0, 8, sink, initial_experts=[0, 1, 2, 3])
+
+    status = plane.set_capacity(0, 2, retain=[2, 3])
+
+    assert status["slot_count"] == 4
+    assert status["active_slot_count"] == 2
+    assert set(status["logical_to_slot"]) == {2, 3}
+    assert sink.slot_count == 4
+    assert set(sink.mapping) == {2, 3}
+
+    mapping = plane.ensure(0, [3, 6])
+    assert set(mapping) == {3, 6}
+    assert len(sink.mapping) == 2
+    assert status["counters"]["capacity_change_count"] == 1
+
+
+def test_logical_capacity_can_restore_all_physical_slots() -> None:
+    sink = MemorySink(4)
+    plane = ExpertSlotDataPlane(MemorySource())
+    plane.register_layer(0, 8, sink, initial_experts=[0, 1, 2, 3])
+    plane.set_capacity(0, 2, retain=[0, 1])
+
+    restored = plane.set_capacity(0, 4)
+    mapping = plane.ensure(0, [0, 1, 4, 5])
+
+    assert restored["active_slot_count"] == 4
+    assert set(mapping) == {0, 1, 4, 5}
+    assert len(sink.mapping) == 4
 
 
 def test_route_misses_are_loaded_as_one_source_batch() -> None:

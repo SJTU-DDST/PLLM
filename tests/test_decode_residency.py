@@ -403,6 +403,17 @@ def test_pareto_bucket_planner_matches_small_exhaustive_oracle() -> None:
             assert result.estimated_slowdown_ratio == pytest.approx(expected[0])
 
 
+def test_route_window_pins_recent_experts_ahead_of_frequency_ranking() -> None:
+    window = DecodeRouteWindow([0], experts_per_layer=8, window_steps=8)
+    window.set_phase("decode")
+    window.observe(0, [0, 1])
+    window.observe(0, [0, 2])
+    window.observe(0, [6, 7])
+
+    assert window.recent_experts(0, 1) == [6, 7]
+    assert window.hot_experts(0, 3, pin_recent_steps=1) == [6, 7, 0]
+
+
 def test_guardrail_forbids_prefill_eviction() -> None:
     guardrail = DecodeResidencyGuardrail(2.538)
     decision = guardrail.choose(
@@ -475,3 +486,38 @@ def test_decode_cache_simulation_seeds_from_prefill_and_preserves_routes() -> No
     assert small.expert_accesses == 8
     assert small.blocking_misses == 2
     assert small.miss_bytes == 200
+
+
+def test_decode_cache_simulation_recent_pin_reduces_one_hit_pollution() -> None:
+    prefill = np.array([[[0], [0]], [[1], [1]]], dtype=np.uint16)
+    decode = np.array(
+        [
+            [[2], [2]],
+            [[3], [3]],
+            [[2], [2]],
+            [[4], [4]],
+            [[2], [2]],
+        ],
+        dtype=np.uint16,
+    )
+
+    unpinned = simulate_decode_cache(
+        prefill,
+        decode,
+        2,
+        100,
+        policy="window_lfu",
+        experts_per_layer=8,
+    )
+    pinned = simulate_decode_cache(
+        prefill,
+        decode,
+        2,
+        100,
+        policy="window_lfu",
+        experts_per_layer=8,
+        protect_recent_tokens=2,
+    )
+
+    assert pinned.protect_recent_tokens == 2
+    assert pinned.blocking_misses <= unpinned.blocking_misses

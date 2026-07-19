@@ -117,7 +117,7 @@ class PLLMConfig:
         default_factory=lambda: [0.477, 0.784, 1.513, 2.863, 26.223, 42.710, 43.897]
     )
     loader_mode: str = "auto"
-    rdma_peer: str = "192.168.70.71"
+    rdma_peer: str = ""
     rdma_control_port: int = 18515
     remote_weight_source_enabled: bool = False
     policy_advisor_url: str = ""

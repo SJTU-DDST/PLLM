@@ -1,0 +1,3 @@
+physical_slots_per_layer,rounds,mean_gpu_memory_mib,mean_tpot_ms,misses_per_text_event,successful_output_rate,tpot_slowdown,measured_gpu_reclaim_mib
+384,3,66144.0,216.20622234315508,36.68817204301075,1.0,1.0,0.0
+380,3,65824.0,225.30336194516468,38.8494623655914,1.0,1.0420762154919434,320.0

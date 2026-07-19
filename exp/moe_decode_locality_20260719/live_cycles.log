@@ -1,0 +1,17 @@
+warmup=1/2
+warmup=2/2
+round=1/3 arm=resident_baseline
+round=1/3 arm=pause_only
+round=1/3 arm=pause_evict_320
+round=1/3 arm=pause_evict_352
+round=1/3 arm=pause_evict_368
+round=2/3 arm=pause_only
+round=2/3 arm=pause_evict_320
+round=2/3 arm=pause_evict_352
+round=2/3 arm=pause_evict_368
+round=2/3 arm=resident_baseline
+round=3/3 arm=pause_evict_320
+round=3/3 arm=pause_evict_352
+round=3/3 arm=pause_evict_368
+round=3/3 arm=resident_baseline
+round=3/3 arm=pause_only

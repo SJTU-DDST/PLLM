@@ -81,6 +81,19 @@ class ExpertRuntimeClient:
             payload["miss_debt_budget_ms"] = float(miss_debt_budget_ms)
         return self.request(payload, timeout=max(self.timeout_seconds, 600.0))
 
+    def set_capacity(
+        self, slots_per_layer: int, retain_policy: str = "lru"
+    ) -> dict[str, Any]:
+        return self.request(
+            {
+                "command": "set_capacity",
+                "slots_per_layer": slots_per_layer,
+                "retain_policy": retain_policy,
+                "quiesced": True,
+            },
+            timeout=max(self.timeout_seconds, 600.0),
+        )
+
     def set_phase(self, phase: str, reset_decode: bool = False) -> dict[str, Any]:
         return self.request(
             {
@@ -88,6 +101,11 @@ class ExpertRuntimeClient:
                 "phase": phase,
                 "reset_decode": reset_decode,
             }
+        )
+
+    def set_pin_recent_steps(self, steps: int) -> dict[str, Any]:
+        return self.request(
+            {"command": "set_pin_recent_steps", "steps": int(steps)}
         )
 
     def prefetch(self, layer: int, experts: list[int]) -> dict[str, Any]:
