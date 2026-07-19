@@ -94,3 +94,56 @@ def test_missing_catalog_reports_unavailable(tmp_path: Path) -> None:
     assert status["available"] is False
     assert status["data_plane_ready"] is False
     assert status["error"]
+
+
+def test_decode_plan_requires_live_decode_observations(tmp_path: Path) -> None:
+    model = _write_fake_model(tmp_path / "model")
+    control = ExpertResidencyControlPlane(
+        PLLMConfig(
+            model_path=str(model),
+            decode_candidate_slots=[2, 3],
+            decode_min_route_observations=4,
+        )
+    )
+
+    result = control.plan_decode_residency(
+        {
+            "route_trace": {
+                "phase": "decode",
+                "decode_observations": 2,
+                "projected_byte_hit_rate": {"2": 0.9, "3": 1.0},
+            }
+        }
+    )
+
+    assert result["action"] == "observe"
+    assert result["slots_per_layer"] == 4
+
+
+def test_decode_plan_uses_guardrail_after_window_is_warm(tmp_path: Path) -> None:
+    model = _write_fake_model(tmp_path / "model")
+    control = ExpertResidencyControlPlane(
+        PLLMConfig(
+            model_path=str(model),
+            decode_candidate_slots=[2, 3],
+            decode_min_route_observations=1,
+            decode_min_byte_hit_rate=0.95,
+            decode_baseline_tpot_ms=100,
+            expert_requested_token_rate=1,
+            expert_io_budget_gib_s=1,
+        )
+    )
+
+    result = control.plan_decode_residency(
+        {
+            "route_trace": {
+                "phase": "decode",
+                "decode_observations": 8,
+                "projected_byte_hit_rate": {"2": 0.7, "3": 0.99},
+            }
+        }
+    )
+
+    assert result["action"] == "decode_elastic"
+    assert result["slots_per_layer"] == 3
+    assert result["latency_guardrail"] == "strictly_below_10x"

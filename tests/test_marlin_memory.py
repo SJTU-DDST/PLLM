@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from pllm.vllm_eer_runtime import (
+    cache_storage_signature,
     flatten_cache_tensors,
     low_memory_nvfp4_scale_factor,
     release_export_layer,
@@ -84,3 +85,18 @@ def test_flatten_cache_tensors_handles_hybrid_cache_layout() -> None:
         actual is expected
         for actual, expected in zip(flattened, (attention, mamba_conv, mamba_ssm))
     )
+
+
+def test_cache_storage_signature_deduplicates_views_without_copying() -> None:
+    attention = torch.ones(16)
+    attention_view = attention.view(4, 4)
+    mamba = torch.ones(8)
+
+    before = cache_storage_signature([attention, attention_view, [mamba]])
+    after = cache_storage_signature([attention, attention_view, [mamba]])
+
+    assert before == after
+    assert before["tensor_count"] == 3
+    assert before["storage_count"] == 2
+    assert before["allocated_bytes"] == 24 * attention.element_size()
+    assert before["copy_bytes"] == 0

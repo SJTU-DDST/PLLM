@@ -26,6 +26,7 @@ def test_pool_help_describes_both_modes(pool_binary: Path) -> None:
     assert result.returncode == 0
     assert "--server" in result.stdout
     assert "--client" in result.stdout
+    assert "stream-get" in result.stdout
 
 
 def test_pool_rejects_invalid_pipeline_depth(pool_binary: Path) -> None:

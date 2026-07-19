@@ -90,7 +90,7 @@
           <div class="section-heading">
             <div>
               <span class="eyebrow">SPARKLOAD DATA PATH</span>
-              <h3>GPU / UMA / NVMe / RDMA 四级内存流</h3>
+              <h3>Local GPU / UMA · 状态小岛 · Remote DRAM · NVMe 回退</h3>
             </div>
             <div class="legend"><span class="dot live"></span>实时路径 <span class="dot candidate"></span>候选路径</div>
           </div>
@@ -133,11 +133,13 @@
             </div>
           </div>
           <div class="expert-metrics">
-            <div><span>{{ expertResidency.data_plane_ready ? '实时 Slots' : '规划 Slots' }}</span><strong>{{ expertActiveSlots || '--' }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
-            <div><span>投影驻留</span><strong>{{ metric(expertPlan.projected_resident_gib, ' GiB', 1) }}</strong></div>
+            <div><span>推理相位</span><strong>{{ routeTrace.phase || 'idle' }}</strong></div>
+            <div><span>{{ expertResidency.data_plane_ready ? '实时 Slots' : '候选 Slots' }}</span><strong>{{ expertActiveSlots || '--' }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
             <div><span>投影释放</span><strong>{{ metric(expertPlan.projected_reclaim_gib, ' GiB', 1) }}</strong></div>
-            <div><span>预计 Miss 流量</span><strong>{{ metric(expertPlan.estimated_miss_gib_s, ' GiB/s', 2) }}</strong></div>
-            <div><span>Token Rate Cap</span><strong>{{ metric(expertPlan.token_rate_limit, ' tok/s', 2) }}</strong></div>
+            <div><span>路由观测</span><strong>{{ routeTrace.decode_observations ?? expertPlan.observations ?? 0 }}</strong></div>
+            <div><span>投影命中</span><strong>{{ percent(expertPlan.projected_byte_hit_rate) }}</strong></div>
+            <div><span>延迟上界</span><strong>{{ ratio(expertPlan.estimated_slowdown_ratio) }}</strong></div>
+            <div><span>KV/Mamba 状态</span><strong>{{ formatBytes(stateIsland.allocated_bytes) }}</strong></div>
           </div>
           <div class="expert-layer-grid" :class="`plan-${expertPlan.action || 'unknown'}`">
             <div v-for="layer in expertLayerCells" :key="layer.index" :title="`MoE layer ${layer.index}: ${layer.slots} slots`">
@@ -148,15 +150,15 @@
             <i data-lucide="route"></i>
             <strong>{{ expertPlan.action || 'awaiting_plan' }}</strong>
             <span>{{ expertPlan.reason || expertResidency.guardrail || 'recommendation_only_no_vllm_weight_mutation' }}</span>
-            <em>Top-k {{ expertModel.top_k || 22 }} · PLAN {{ expertPlan.slots_per_layer ?? '--' }} · {{ expertPlan.executable ? 'EXECUTABLE' : 'NOT EXECUTABLE' }}</em>
+            <em>Top-k {{ expertModel.top_k || 22 }} · {{ routeTrace.phase || 'idle' }} · &lt;10x HARD GUARD</em>
             <button class="apply-expert" :disabled="!expertPlan.executable || expertActionBusy" @click="applyExpertPlan" title="应用物理专家槽位">
               <i data-lucide="refresh-cw"></i><span>{{ expertActionBusy ? '切换中' : '应用槽位' }}</span>
             </button>
           </div>
           <div class="expert-data-line" :class="{ live: expertDataPlane.data_plane_ready }">
-            <span><i data-lucide="hard-drive"></i> SSD {{ expertDataPlane.cache?.objects ?? 0 }} objects</span>
-            <span><i data-lucide="network"></i> RDMA {{ expertDataPlane.rdma?.enabled ? expertDataPlane.rdma.peer : 'local fallback' }}</span>
-            <span><i data-lucide="layers-3"></i> {{ expertDataPlane.data_plane?.layers?.length ?? 0 }} live layers</span>
+            <span><i data-lucide="copy"></i> resize GPU-copy retained rows</span>
+            <span><i data-lucide="network"></i> miss source {{ expertDataPlane.rdma?.enabled ? expertDataPlane.rdma.peer : 'local NVMe fallback' }}</span>
+            <span><i data-lucide="shield-check"></i> state island {{ stateIsland.resize_guard?.preserved === true ? 'preserved' : 'pending validation' }}</span>
           </div>
         </section>
 

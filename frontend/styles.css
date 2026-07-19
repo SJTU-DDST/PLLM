@@ -117,7 +117,7 @@ main { padding-bottom: 72px; }
 .preset-switch { height: 34px; display: flex; border: 1px solid var(--line); padding: 3px; background: #0b0e0d; }
 .preset-switch button { min-width: 54px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 10px; }
 .preset-switch button.active { color: var(--text); background: var(--surface-2); }
-.expert-metrics { margin-top: 22px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.expert-metrics { margin-top: 22px; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .expert-metrics > div { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--line); }
 .expert-metrics > div:first-child { padding-left: 0; }
 .expert-metrics > div:last-child { border-right: 0; }
@@ -239,7 +239,7 @@ main { padding-bottom: 72px; }
   .panel { border-right: 0; border-bottom: 1px solid var(--line); }
   .evidence-grid { grid-template-columns: 1fr; }
   .expert-controls { width: 100%; justify-content: space-between; }
-  .expert-metrics { grid-template-columns: repeat(3, 1fr); }
+  .expert-metrics { grid-template-columns: repeat(4, 1fr); }
   .expert-metrics > div { border-bottom: 1px solid var(--line); }
   .policy-band { grid-template-columns: 1fr auto; }
   .policy-band > div { grid-column: 1 / -1; }

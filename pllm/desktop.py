@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 STATE_LABELS = {
     "active": "AI 可用",
+    "elastic_resident": "Decode 弹性驻留",
     "yielding": "请求已冻结",
     "quiescing": "正在让出 GPU",
     "hibernated": "深度休眠",
@@ -49,6 +50,7 @@ STATE_LABELS = {
 
 STATE_COLORS = {
     "active": "#37d67a",
+    "elastic_resident": "#35c6d0",
     "yielding": "#f1b84b",
     "quiescing": "#f1b84b",
     "hibernated": "#65a9ff",
@@ -288,6 +290,13 @@ class OverlayWindow(QWidget):
         detail_header.addWidget(self.action_label)
         detail_layout.addLayout(detail_header)
 
+        self.expert_label = QLabel("Decode  idle · slots -- · route --")
+        self.state_island_label = QLabel("KV/Mamba 状态小岛  --")
+        self.expert_label.setObjectName("sectionValue")
+        self.state_island_label.setObjectName("sectionValue")
+        detail_layout.addWidget(self.expert_label)
+        detail_layout.addWidget(self.state_island_label)
+
         self.sparkline = Sparkline()
         detail_layout.addWidget(self.sparkline)
 
@@ -384,9 +393,30 @@ class OverlayWindow(QWidget):
             self.action_label.setText(f"操作 {duration:.0f} ms")
         else:
             self.action_label.setText("最近操作  --")
+        residency = status.get("expert_residency") or {}
+        data_plane = residency.get("data_plane") or {}
+        decode_plan = residency.get("decode_plan") or {}
+        route_trace = data_plane.get("route_trace") or {}
+        state_island = data_plane.get("state_island") or {}
+        phase = str(route_trace.get("phase") or "idle")
+        slots = data_plane.get("slots_per_layer", decode_plan.get("slots_per_layer"))
+        observations = route_trace.get(
+            "decode_observations", decode_plan.get("observations", 0)
+        )
+        self.expert_label.setText(
+            f"Decode  {phase} · slots {slots or '--'}/512 · route {observations or 0}"
+        )
+        island_bytes = int(state_island.get("allocated_bytes") or 0)
+        guard = state_island.get("resize_guard") or {}
+        guard_text = "preserved" if guard.get("preserved") is True else "pending"
+        island_text = f"{island_bytes / 1024**2:.0f} MiB" if island_bytes else "--"
+        self.state_island_label.setText(
+            f"KV/Mamba 状态小岛  {island_text} · {guard_text}"
+        )
         self.sparkline.add_value(gpu_util)
         self.release_button.setEnabled(
-            state in {"active", "yielding"} and controllable > 0
+            state in {"active", "elastic_resident", "yielding"}
+            and controllable > 0
         )
         self.wake_button.setEnabled(
             state in {"yielding", "hibernated", "hot_sleep", "cold_sleep", "error"}
@@ -427,11 +457,11 @@ class OverlayWindow(QWidget):
     def load_demo(self) -> None:
         self.update_status(
             {
-                "state": "hibernated",
+                "state": "elastic_resident",
                 "mode": "auto",
-                "reason": "creative foreground GPU activity 84%",
-                "last_action_duration_ms": 1840,
-                "reclaimed_gb": 74.6,
+                "reason": "DEMO SCENARIO: decode 496-slot guardrail passed",
+                "last_action_duration_ms": None,
+                "reclaimed_gb": 1.8,
                 "services": [{"controllable": True}],
                 "sensor": {
                     "gpu_util": 22,
@@ -440,12 +470,26 @@ class OverlayWindow(QWidget):
                     "power_watts": 126,
                     "foreground": {"app_id": "Blender"},
                 },
+                "expert_residency": {
+                    "decode_plan": {"slots_per_layer": 496, "observations": 880},
+                    "data_plane": {
+                        "slots_per_layer": 496,
+                        "route_trace": {
+                            "phase": "decode",
+                            "decode_observations": 880,
+                        },
+                        "state_island": {
+                            "allocated_bytes": 441450496,
+                            "resize_guard": {"preserved": True},
+                        },
+                    },
+                },
             }
         )
         self.update_events(
             [
-                {"event_type": "hibernate", "reason": "Blender render became active"},
-                {"event_type": "policy", "reason": "selected Level 2 keep mode"},
+                {"event_type": "expert_dataplane", "reason": "scenario: 496-slot decode"},
+                {"event_type": "policy", "reason": "strict latency guardrail"},
             ]
         )
         self.update_replays(
@@ -479,7 +523,7 @@ class OverlayWindow(QWidget):
         self.expanded = expanded
         self.details.setVisible(expanded)
         self.expand_button.setText("收起" if expanded else "展开")
-        self.setFixedHeight(535 if expanded else 230)
+        self.setFixedHeight(590 if expanded else 230)
 
     def _position_window(self) -> None:
         screen = QApplication.primaryScreen()

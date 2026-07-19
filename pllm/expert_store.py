@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -496,6 +498,307 @@ class RDMAExpertStore:
             self.transport.put(key, path)
 
 
+class RDMAPoolStream:
+    """Persistent-QP byte stream backed by the volatile remote memory pool."""
+
+    RESPONSE = struct.Struct("!IQI")
+
+    def __init__(
+        self,
+        peer: str,
+        port: int,
+        binary: str | Path,
+        index_file: str | Path,
+        token_file: str | Path = "",
+        timeout_seconds: float = 30.0,
+        allocator: str = "cuda-host",
+        device: str = "",
+        ib_port: int = 1,
+        gid_index: int = 0,
+        batch_size: int = 32,
+    ) -> None:
+        if allocator not in {"aligned", "cuda-host"}:
+            raise ValueError("RDMA allocator must be aligned or cuda-host")
+        self.peer = peer
+        self.port = int(port)
+        self.binary = Path(binary)
+        self.index_file = Path(index_file)
+        self.token_file = Path(token_file).expanduser() if token_file else None
+        self.timeout_seconds = float(timeout_seconds)
+        self.allocator = allocator
+        self.device = device
+        self.ib_port = int(ib_port)
+        self.gid_index = int(gid_index)
+        if batch_size <= 0 or batch_size > 32:
+            raise ValueError("RDMA pool stream batch size must be within [1, 32]")
+        self.batch_size = int(batch_size)
+        self._process: subprocess.Popen[bytes] | None = None
+        self._lock = threading.Lock()
+        self._gets = 0
+        self._bytes = 0
+        self._failures = 0
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.peer
+            and self.binary.is_file()
+            and self.index_file.is_file()
+            and (self.token_file is None or self.token_file.is_file())
+        )
+
+    def get(self, key: str | Path) -> bytes:
+        return self.get_many([key])[0]
+
+    def get_many(self, keys: list[str | Path]) -> list[bytes]:
+        if not keys:
+            return []
+        encoded_keys = [self._encode_key(key) for key in keys]
+        results: list[bytes] = []
+        with self._lock:
+            for begin in range(0, len(encoded_keys), self.batch_size):
+                chunk = encoded_keys[begin : begin + self.batch_size]
+                results.extend(self._get_chunk(chunk))
+        return results
+
+    def close(self) -> None:
+        with self._lock:
+            process = self._process
+            self._process = None
+            if process is None:
+                return
+            try:
+                if process.stdin is not None and process.poll() is None:
+                    process.stdin.write(struct.pack("!I", 0))
+                    process.stdin.flush()
+                    process.stdin.close()
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                process.kill()
+                process.wait(timeout=3)
+
+    def status(self) -> dict[str, Any]:
+        process = self._process
+        return {
+            "available": self.available,
+            "connected": bool(process and process.poll() is None),
+            "peer": self.peer,
+            "port": self.port,
+            "index": str(self.index_file),
+            "gets": self._gets,
+            "bytes": self._bytes,
+            "failures": self._failures,
+            "persistent_qp": True,
+            "batch_size": self.batch_size,
+            "remote_disk_io": False,
+            "local_disk_io": False,
+            "gpudirect_claimed": False,
+        }
+
+    def _ensure_process(self) -> subprocess.Popen[bytes]:
+        process = self._process
+        if process is not None and process.poll() is None:
+            return process
+        if not self.available:
+            raise FileNotFoundError("RDMA pool stream binary, index, or token is missing")
+        command = [
+            str(self.binary),
+            "--client",
+            self.peer,
+            "--port",
+            str(self.port),
+            "--operation",
+            "stream-get",
+            "--index",
+            str(self.index_file),
+            "--allocator",
+            self.allocator,
+            "--ib-port",
+            str(self.ib_port),
+            "--gid-index",
+            str(self.gid_index),
+            "--queue-depth",
+            str(self.batch_size),
+        ]
+        if self.device:
+            command.extend(["--device", self.device])
+        if self.token_file is not None:
+            command.extend(["--token-file", str(self.token_file)])
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._process = process
+        return process
+
+    def _get_chunk(self, encoded_keys: list[bytes]) -> list[bytes]:
+        process = self._ensure_process()
+        assert process.stdin is not None
+        request = bytearray(struct.pack("!II", 0xFFFFFFFF, len(encoded_keys)))
+        for key in encoded_keys:
+            request.extend(struct.pack("!I", len(key)))
+            request.extend(key)
+        try:
+            process.stdin.write(request)
+            process.stdin.flush()
+            results = []
+            errors = []
+            for _key in encoded_keys:
+                header = self._read_exact(self.RESPONSE.size)
+                status, payload_size, message_size = self.RESPONSE.unpack(header)
+                if message_size > 64 * 1024 or payload_size > 128 * 1024 * 1024:
+                    raise OSError("invalid RDMA pool stream response size")
+                message = self._read_exact(message_size).decode(
+                    "utf-8", errors="replace"
+                )
+                payload = self._read_exact(payload_size)
+                if status != 0:
+                    errors.append(message or "RDMA pool stream GET failed")
+                results.append(payload)
+            if errors:
+                raise FileNotFoundError("; ".join(errors))
+            self._gets += len(results)
+            self._bytes += sum(len(payload) for payload in results)
+            return results
+        except Exception:
+            self._failures += 1
+            if process.poll() is not None:
+                self._process = None
+            raise
+
+    @staticmethod
+    def _encode_key(key: str | Path) -> bytes:
+        encoded = Path(key).as_posix().encode("utf-8")
+        if not encoded or len(encoded) > 4096:
+            raise ValueError("RDMA pool key must contain 1-4096 UTF-8 bytes")
+        return encoded
+
+    def _read_exact(self, size: int) -> bytes:
+        if size == 0:
+            return b""
+        process = self._process
+        if process is None or process.stdout is None:
+            raise OSError("RDMA pool stream is not running")
+        descriptor = process.stdout.fileno()
+        deadline = time.monotonic() + self.timeout_seconds
+        result = bytearray()
+        while len(result) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("RDMA pool stream response timed out")
+            readable, _, _ = select.select([descriptor], [], [], remaining)
+            if not readable:
+                raise TimeoutError("RDMA pool stream response timed out")
+            block = os.read(descriptor, size - len(result))
+            if not block:
+                error = b""
+                if process.stderr is not None:
+                    error = process.stderr.read() or b""
+                raise OSError(
+                    "RDMA pool stream closed: "
+                    + error.decode("utf-8", errors="replace").strip()
+                )
+            result.extend(block)
+        return bytes(result)
+
+
+class RDMAPoolExpertStore:
+    """Decodes remote warm expert bytes without a local filesystem write."""
+
+    def __init__(
+        self,
+        transport: RDMAPoolStream,
+        local_layout: SSDExpertStore,
+        verify_hot_path: bool = False,
+    ) -> None:
+        self.transport = transport
+        self.local_layout = local_layout
+        self.verify_hot_path = verify_hot_path
+        self._keys = self._read_keys(transport.index_file)
+        self._primed: dict[str, bytes] = {}
+        self._prime_error = ""
+
+    def contains(self, layer: int, expert: int) -> bool:
+        return self.transport.available and self._key(layer, expert) in self._keys
+
+    def get(self, layer: int, expert: int) -> ExpertPayload:
+        key = self._key(layer, expert)
+        if key not in self._keys:
+            raise KeyError(f"expert {layer}:{expert} is absent from the warm profile")
+        payload = ExpertPackageCodec.decode(
+            self._primed.pop(key, None) or self.transport.get(key),
+            verify=self.verify_hot_path,
+        )
+        self.local_layout._validate(payload, layer, expert)
+        return payload
+
+    def get_many(self, requests: list[tuple[int, int]]) -> list[ExpertPayload]:
+        keys = [self._key(layer, expert) for layer, expert in requests]
+        missing = [key for key in keys if key not in self._keys]
+        if missing:
+            raise KeyError(f"experts are absent from the warm profile: {missing[:4]}")
+        blobs: list[bytes | None] = [None] * len(keys)
+        remote_indexes = []
+        remote_keys = []
+        for index, key in enumerate(keys):
+            primed = self._primed.pop(key, None)
+            if primed is None:
+                remote_indexes.append(index)
+                remote_keys.append(key)
+            else:
+                blobs[index] = primed
+        for index, blob in zip(remote_indexes, self.transport.get_many(remote_keys)):
+            blobs[index] = blob
+        payloads = [
+            ExpertPackageCodec.decode(blob, verify=self.verify_hot_path)
+            for blob in blobs
+            if blob is not None
+        ]
+        if len(payloads) != len(requests):
+            raise RuntimeError("RDMA pool returned an incomplete expert batch")
+        for payload, (layer, expert) in zip(payloads, requests):
+            self.local_layout._validate(payload, layer, expert)
+        return payloads
+
+    def status(self) -> dict[str, Any]:
+        result = self.transport.status()
+        result["profile_objects"] = len(self._keys)
+        result["hot_path_sha256"] = self.verify_hot_path
+        result["primed_objects"] = len(self._primed)
+        result["prime_error"] = self._prime_error
+        return result
+
+    def prime(self) -> None:
+        if self._primed or not self._keys:
+            return
+        key = min(self._keys)
+        try:
+            self._primed[key] = self.transport.get(key)
+            self._prime_error = ""
+        except Exception as exc:
+            self._prime_error = f"{type(exc).__name__}: {exc}"
+
+    def _key(self, layer: int, expert: int) -> str:
+        return self.local_layout.path_for(layer, expert).relative_to(
+            self.local_layout.root
+        ).as_posix()
+
+    @staticmethod
+    def _read_keys(index_file: Path) -> set[str]:
+        keys = set()
+        for line in index_file.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            _slot, key, _size = line.split("\t")
+            keys.add(key)
+        if not keys:
+            raise ValueError("RDMA warm profile index is empty")
+        return keys
+
+
 class TieredExpertSource:
     def __init__(self, sources: list[ExpertSource]) -> None:
         self.sources = list(sources)
@@ -514,6 +817,44 @@ class TieredExpertSource:
                 errors.append(f"{source.__class__.__name__}: {exc}")
         detail = "; ".join(errors) if errors else "no configured tier contains it"
         raise FileNotFoundError(f"expert {layer}:{expert} unavailable: {detail}")
+
+    def get_many(self, requests: list[tuple[int, int]]) -> list[ExpertPayload]:
+        if not requests:
+            return []
+        selected: dict[int, list[tuple[int, tuple[int, int]]]] = {}
+        for index, request in enumerate(requests):
+            layer, expert = request
+            source_index = next(
+                (
+                    candidate
+                    for candidate, source in enumerate(self.sources)
+                    if source.contains(layer, expert)
+                ),
+                -1,
+            )
+            if source_index < 0:
+                raise FileNotFoundError(f"expert {layer}:{expert} has no source")
+            selected.setdefault(source_index, []).append((index, request))
+
+        result: list[ExpertPayload | None] = [None] * len(requests)
+        for source_index, rows in selected.items():
+            source = self.sources[source_index]
+            source_get_many = getattr(source, "get_many", None)
+            try:
+                payloads = (
+                    source_get_many([request for _index, request in rows])
+                    if callable(source_get_many)
+                    else [source.get(*request) for _index, request in rows]
+                )
+                if len(payloads) != len(rows):
+                    raise RuntimeError("tier returned a short expert batch")
+            except (OSError, ValueError, KeyError, RuntimeError):
+                payloads = [self.get(*request) for _index, request in rows]
+            for (index, _request), payload in zip(rows, payloads):
+                result[index] = payload
+        if any(payload is None for payload in result):
+            raise RuntimeError("tiered expert batch is incomplete")
+        return [payload for payload in result if payload is not None]
 
 
 def model_fingerprint(model_root: str | Path) -> str:

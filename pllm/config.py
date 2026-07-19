@@ -82,6 +82,9 @@ class PLLMConfig:
     expert_runtime_socket: str = ""
     expert_rdma_port: int = 17900
     expert_rdma_binary: str = "rdma_bridge/build/pllm-rdma-store"
+    expert_rdma_pool_port: int = 17902
+    expert_rdma_pool_binary: str = "rdma_bridge/build/pllm-rdma-pool"
+    expert_rdma_pool_index: str = ""
     expert_rdma_token_file: str = "~/.config/pllm/rdma-token"
     expert_system_reserve_gib: float = 16.0
     expert_io_budget_gib_s: float = 2.0
@@ -90,6 +93,16 @@ class PLLMConfig:
     expert_release_deadline_ms: float = 500.0
     expert_assumed_byte_hit_rate: float = 0.95
     expert_assumed_false_prefetch_ratio: float = 0.05
+    decode_elastic_enabled: bool = True
+    decode_route_window_steps: int = 256
+    decode_min_route_observations: int = 320
+    decode_candidate_slots: list[int] = field(
+        default_factory=lambda: [384, 448, 480, 496, 504]
+    )
+    decode_min_byte_hit_rate: float = 0.95
+    decode_max_slowdown_ratio: float = 5.0
+    decode_baseline_tpot_ms: float = 100.0
+    decode_miss_latency_p95_ms: float = 7.5
     loader_mode: str = "auto"
     rdma_peer: str = "192.168.70.71"
     rdma_control_port: int = 18515
@@ -164,10 +177,13 @@ class PLLMConfig:
                 "rdma_control_port",
                 "expert_slots_per_layer",
                 "expert_rdma_port",
+                "expert_rdma_pool_port",
                 "hiberstate_chunk_mb",
                 "hiberstate_rdma_port",
                 "hiberstate_rdma_ib_port",
                 "hiberstate_rdma_gid_index",
+                "decode_route_window_steps",
+                "decode_min_route_observations",
             }:
                 value = int(value)
             if key in {
@@ -185,6 +201,10 @@ class PLLMConfig:
                 "expert_assumed_false_prefetch_ratio",
                 "expert_runtime_cache_quota_gib",
                 "expert_resize_cooldown_seconds",
+                "decode_min_byte_hit_rate",
+                "decode_max_slowdown_ratio",
+                "decode_baseline_tpot_ms",
+                "decode_miss_latency_p95_ms",
             }:
                 value = float(value)
             setattr(self, key, value)

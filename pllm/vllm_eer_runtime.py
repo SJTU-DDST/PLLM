@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -16,9 +17,12 @@ from typing import Any
 from .config import DEFAULT_EXPERT_CACHE_DIR, pllm_runtime_dir
 from .expert_dataplane import ExpertSlotDataPlane
 from .expert_catalog import ExpertCatalog
+from .decode_residency import DecodeRouteWindow
 from .expert_store import (
     ExpertPayload,
     RDMAExpertStore,
+    RDMAPoolExpertStore,
+    RDMAPoolStream,
     SSDExpertStore,
     TieredExpertSource,
     model_fingerprint,
@@ -93,6 +97,31 @@ def flatten_cache_tensors(value: Any) -> list[Any]:
     return flattened
 
 
+def cache_storage_signature(value: Any) -> dict[str, Any]:
+    """Describe cache allocations without copying or synchronizing tensor data."""
+    storages: dict[tuple[str, int], int] = {}
+    tensors = flatten_cache_tensors(value)
+    for tensor in tensors:
+        if not hasattr(tensor, "untyped_storage"):
+            continue
+        storage = tensor.untyped_storage()
+        key = (str(tensor.device), int(storage.data_ptr()))
+        storages[key] = max(storages.get(key, 0), int(storage.nbytes()))
+    encoded = "|".join(
+        f"{device}:{pointer}:{size}"
+        for (device, pointer), size in sorted(storages.items())
+    ).encode()
+    return {
+        "attached": bool(tensors),
+        "tensor_count": len(tensors),
+        "storage_count": len(storages),
+        "allocated_bytes": sum(storages.values()),
+        "allocation_fingerprint": hashlib.sha256(encoded).hexdigest(),
+        "copy_bytes": 0,
+        "scope": "attention_kv_and_mamba_conv_ssm_allocations",
+    }
+
+
 @dataclass(slots=True, frozen=True)
 class EERRuntimeConfig:
     mode: str
@@ -109,6 +138,10 @@ class EERRuntimeConfig:
     rdma_device: str
     rdma_ib_port: int
     rdma_gid_index: int
+    rdma_pool_port: int
+    rdma_pool_binary: Path
+    rdma_pool_index: Path | None
+    route_window_steps: int
 
     @classmethod
     def from_environment(cls) -> "EERRuntimeConfig":
@@ -152,6 +185,19 @@ class EERRuntimeConfig:
             rdma_device=os.getenv("PLLM_EER_RDMA_DEVICE", "").strip(),
             rdma_ib_port=int(os.getenv("PLLM_EER_RDMA_IB_PORT", "1")),
             rdma_gid_index=int(os.getenv("PLLM_EER_RDMA_GID_INDEX", "0")),
+            rdma_pool_port=int(os.getenv("PLLM_EER_RDMA_POOL_PORT", "17902")),
+            rdma_pool_binary=Path(
+                os.getenv(
+                    "PLLM_EER_RDMA_POOL_BINARY",
+                    str(Path.cwd() / "rdma_bridge/build/pllm-rdma-pool"),
+                )
+            ),
+            rdma_pool_index=(
+                Path(os.environ["PLLM_EER_RDMA_POOL_INDEX"]).expanduser()
+                if os.getenv("PLLM_EER_RDMA_POOL_INDEX")
+                else None
+            ),
+            route_window_steps=int(os.getenv("PLLM_EER_ROUTE_WINDOW_STEPS", "256")),
         )
 
 
@@ -250,6 +296,53 @@ class TorchMarlinSlotSink:
         self._specs = self._tensor_specs()
         self.publish_mapping({}, getattr(self.layer, "_pllm_eer_generation", 0) + 1)
 
+    def resize_with_retained(
+        self, slot_count: int, retained: list[tuple[int, int]]
+    ) -> dict[str, Any]:
+        torch = self.torch
+        method = self.layer.quant_method
+        method.moe_kernel = None
+        method.moe_quant_config = None
+        specs = self._tensor_specs()
+        old_parameters = {name: getattr(self.layer, name) for name, *_ in specs}
+        new_parameters: dict[str, Any] = {}
+        bytes_copied = 0
+        old_slots = torch.tensor(
+            [physical for _logical, physical in retained],
+            dtype=torch.long,
+            device=next(iter(old_parameters.values())).device,
+        )
+        for name, dtype, row_shape, device in specs:
+            parameter = torch.nn.Parameter(
+                torch.empty((slot_count, *row_shape), dtype=dtype, device=device),
+                requires_grad=False,
+            )
+            old = old_parameters[name].data
+            for offset in range(0, len(retained), 8):
+                indexes = old_slots[offset : offset + 8]
+                parameter.data[offset : offset + len(indexes)].copy_(
+                    old.index_select(0, indexes), non_blocking=False
+                )
+            bytes_copied += len(retained) * old[0].numel() * old.element_size()
+            new_parameters[name] = parameter
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        for name, parameter in new_parameters.items():
+            setattr(self.layer, name, parameter)
+        old_parameters.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self.slot_count = slot_count
+        self.layer.num_experts = slot_count
+        self.layer.local_num_experts = slot_count
+        self.layer.moe_config.num_local_experts = slot_count
+        self._specs = self._tensor_specs()
+        mapping = {logical: index for index, (logical, _old) in enumerate(retained)}
+        self.publish_mapping(mapping, getattr(self.layer, "_pllm_eer_generation", 0) + 1)
+        return {"mapping": mapping, "bytes_copied": bytes_copied}
+
     def finish_resize(self) -> None:
         from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
             make_nvfp4_moe_kernel,
@@ -288,29 +381,55 @@ class EERRuntime:
         catalog = ExpertCatalog.from_model(config.model_path)
         self.expected_objects = len(catalog.experts)
         self.expected_layers = len(catalog.moe_layers)
+        self.route_window = DecodeRouteWindow(
+            catalog.moe_layers,
+            catalog.experts_per_layer,
+            config.route_window_steps,
+        )
         self.local_store = SSDExpertStore(
             config.cache_dir,
             model_fingerprint=self.fingerprint,
             quota_bytes=config.cache_quota_bytes,
             required_format=RUNTIME_FORMAT,
         )
-        sources: list[Any] = [self.local_store]
+        remote_sources: list[Any] = []
         remote_store = None
+        self.remote_pool: RDMAPoolExpertStore | None = None
         if config.rdma_peer:
             if config.rdma_token_file is None or not config.rdma_token_file.is_file():
                 raise RuntimeError("RDMA warm source requires PLLM_EER_RDMA_TOKEN_FILE")
-            remote_store = RDMAExpertStore(
-                peer=config.rdma_peer,
-                port=config.rdma_port,
-                binary=config.rdma_binary,
-                local_cache=self.local_store,
-                token_file=config.rdma_token_file or "",
-                allocator=config.rdma_allocator,
-                device=config.rdma_device,
-                ib_port=config.rdma_ib_port,
-                gid_index=config.rdma_gid_index,
-            )
-            sources.append(remote_store)
+            if config.rdma_pool_index is not None:
+                stream = RDMAPoolStream(
+                    peer=config.rdma_peer,
+                    port=config.rdma_pool_port,
+                    binary=config.rdma_pool_binary,
+                    index_file=config.rdma_pool_index,
+                    token_file=config.rdma_token_file,
+                    allocator=config.rdma_allocator,
+                    device=config.rdma_device,
+                    ib_port=config.rdma_ib_port,
+                    gid_index=config.rdma_gid_index,
+                )
+                self.remote_pool = RDMAPoolExpertStore(stream, self.local_store)
+                remote_sources.append(self.remote_pool)
+                threading.Thread(
+                    target=self.remote_pool.prime,
+                    name="pllm-rdma-pool-prime",
+                    daemon=True,
+                ).start()
+            else:
+                remote_store = RDMAExpertStore(
+                    peer=config.rdma_peer,
+                    port=config.rdma_port,
+                    binary=config.rdma_binary,
+                    local_cache=self.local_store,
+                    token_file=config.rdma_token_file or "",
+                    allocator=config.rdma_allocator,
+                    device=config.rdma_device,
+                    ib_port=config.rdma_ib_port,
+                    gid_index=config.rdma_gid_index,
+                )
+                remote_sources.append(remote_store)
         if (
             config.mode == "elastic"
             and not self._export_manifest_valid()
@@ -321,7 +440,13 @@ class EERRuntime:
             raise RuntimeError(
                 "elastic EER requires a complete local or RDMA runtime manifest"
             )
-        self.data_plane = ExpertSlotDataPlane(TieredExpertSource(sources))
+        self.initial_source = TieredExpertSource(
+            [self.local_store, *remote_sources]
+        )
+        self.runtime_source = TieredExpertSource(
+            [*remote_sources, self.local_store]
+        )
+        self.data_plane = ExpertSlotDataPlane(self.initial_source)
         self.sinks: dict[int, TorchMarlinSlotSink] = {}
         self.exported_objects = 0
         self.started_at = time.time()
@@ -333,6 +458,29 @@ class EERRuntime:
         self._control_server: _ThreadedUnixServer | None = None
         self._control_thread: threading.Thread | None = None
         self._loader_cache_released = False
+        self._model_runner: Any | None = None
+        self._last_state_island_guard: dict[str, Any] = {
+            "checked": False,
+            "preserved": None,
+        }
+
+    def bind_model_runner(self, model_runner: Any) -> None:
+        self._model_runner = model_runner
+
+    def state_island_status(self) -> dict[str, Any]:
+        if self._model_runner is None:
+            return {
+                "attached": False,
+                "allocated_bytes": 0,
+                "copy_bytes": 0,
+                "scope": "attention_kv_and_mamba_conv_ssm_allocations",
+                "resize_guard": dict(self._last_state_island_guard),
+            }
+        result = cache_storage_signature(
+            getattr(self._model_runner, "kv_caches", None)
+        )
+        result["resize_guard"] = dict(self._last_state_island_guard)
+        return result
 
     def release_loader_cache(self) -> None:
         if self._loader_cache_released:
@@ -395,6 +543,8 @@ class EERRuntime:
             sink=sink,
             initial_experts=initial,
         )
+        if len(self.sinks) == self.expected_layers:
+            self.data_plane.source = self.runtime_source
 
     def ensure(self, layer: Any, topk_ids: Any) -> None:
         if self.config.mode != "elastic":
@@ -407,6 +557,11 @@ class EERRuntime:
             for item in topk_ids.detach().unique().cpu().tolist()
             if int(item) >= 0
         ]
+        self.route_window.observe(
+            layer_id,
+            experts,
+            token_count=max(1, int(topk_ids.shape[0])),
+        )
         self.data_plane.ensure(layer_id, experts, reason="actual_topk")
 
     def handle_command(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -453,10 +608,55 @@ class EERRuntime:
             if request.get("quiesced") is not True:
                 raise RuntimeError("resize requires a token-boundary quiesced=true guard")
             slots = int(request["slots_per_layer"])
+            retain_policy = str(request.get("retain_policy", "lru"))
+            state_before = self.state_island_status()
             results = []
             for layer in self.data_plane.layers():
-                results.append(self.data_plane.resize(layer, slots))
-            return {"resized_layers": len(results), "slots_per_layer": slots}
+                retain = (
+                    self.route_window.hot_experts(layer, slots)
+                    if retain_policy == "decode_hot"
+                    else None
+                )
+                result = self.data_plane.resize(layer, slots, retain=retain)
+                global_experts = int(result.get("global_experts", 0))
+                if slots >= global_experts > 0:
+                    self.data_plane.prefetch(
+                        layer, list(range(global_experts))
+                    )
+                results.append(result)
+            state_after = self.state_island_status()
+            checked = bool(state_before.get("attached"))
+            preserved = (
+                state_before.get("allocation_fingerprint")
+                == state_after.get("allocation_fingerprint")
+                and state_before.get("allocated_bytes")
+                == state_after.get("allocated_bytes")
+                if checked
+                else None
+            )
+            self._last_state_island_guard = {
+                "checked": checked,
+                "preserved": preserved,
+                "before_bytes": int(state_before.get("allocated_bytes", 0)),
+                "after_bytes": int(state_after.get("allocated_bytes", 0)),
+                "copy_bytes": 0,
+            }
+            if checked and not preserved:
+                raise RuntimeError(
+                    "expert resize changed the live KV/Mamba state island allocation"
+                )
+            return {
+                "resized_layers": len(results),
+                "slots_per_layer": slots,
+                "retain_policy": retain_policy,
+                "state_island_guard": dict(self._last_state_island_guard),
+            }
+        if command == "phase":
+            phase = str(request.get("phase", "idle"))
+            self.route_window.set_phase(
+                phase, reset_decode=bool(request.get("reset_decode", False))
+            )
+            return self.route_window.status()
         if command == "suspend":
             if request.get("quiesced") is not True:
                 raise RuntimeError("suspend requires quiesced=true")
@@ -505,10 +705,20 @@ class EERRuntime:
             "rdma": {
                 "enabled": bool(self.config.rdma_peer),
                 "peer": self.config.rdma_peer,
-                "port": self.config.rdma_port,
+                "port": (
+                    self.config.rdma_pool_port
+                    if self.remote_pool is not None
+                    else self.config.rdma_port
+                ),
                 "path": (
-                    "connectx_to_registered_host_buffer_to_local_ssd_cache_"
-                    "to_cuda_slot"
+                    "connectx_persistent_qp_to_pinned_staging_to_cuda_slot"
+                    if self.remote_pool is not None
+                    else "legacy_object_get_to_local_ssd_cache_to_cuda_slot"
+                ),
+                "pool": (
+                    self.remote_pool.status()
+                    if self.remote_pool is not None
+                    else None
                 ),
                 "gpudirect_claimed": False,
             },
@@ -519,6 +729,8 @@ class EERRuntime:
             "uptime_seconds": round(time.time() - self.started_at, 3),
             "last_error": self.last_error,
             "data_plane": data_plane,
+            "route_trace": self.route_window.status(),
+            "state_island": self.state_island_status(),
         }
 
     def _write_export_manifest(self) -> None:
@@ -652,6 +864,7 @@ def install() -> EERRuntime | None:
     original_process = ModelOptNvFp4FusedMoE.process_weights_after_loading
     original_apply = ModelOptNvFp4FusedMoE.apply
     original_init_filter = DefaultModelLoader._init_ep_weight_filter
+    original_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
     original_init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales
 
     def create_weights(method, layer, num_experts, *args, **kwargs):
@@ -718,12 +931,18 @@ def install() -> EERRuntime | None:
         return expert_id is not None and expert_id not in local_expert_ids
 
     def init_fp8_kv_scales(model_runner):
+        runtime.bind_model_runner(model_runner)
         caches = model_runner.kv_caches
         model_runner.kv_caches = flatten_cache_tensors(caches)
         try:
             return original_init_fp8_kv_scales(model_runner)
         finally:
             model_runner.kv_caches = caches
+
+    def initialize_kv_cache(model_runner, *args, **kwargs):
+        result = original_initialize_kv_cache(model_runner, *args, **kwargs)
+        runtime.bind_model_runner(model_runner)
+        return result
 
     ep_weight_filter_should_skip = ep_weight_filter.should_skip_weight
 
@@ -735,6 +954,7 @@ def install() -> EERRuntime | None:
     DefaultModelLoader._init_ep_weight_filter = init_expert_filter
     ep_weight_filter.should_skip_weight = should_skip_weight
     weight_utils.should_skip_weight = should_skip_weight
+    GPUModelRunner.initialize_kv_cache = initialize_kv_cache
     GPUModelRunner.init_fp8_kv_scales = init_fp8_kv_scales
     marlin_utils_fp4._nvfp4_compute_scale_factor = (
         low_memory_nvfp4_scale_factor

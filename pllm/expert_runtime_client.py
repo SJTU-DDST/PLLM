@@ -53,14 +53,26 @@ class ExpertRuntimeClient:
                 self._cached_at = 0.0
         return result
 
-    def resize(self, slots_per_layer: int) -> dict[str, Any]:
+    def resize(
+        self, slots_per_layer: int, retain_policy: str = "lru"
+    ) -> dict[str, Any]:
         return self.request(
             {
                 "command": "resize",
                 "slots_per_layer": slots_per_layer,
+                "retain_policy": retain_policy,
                 "quiesced": True,
             },
             timeout=max(self.timeout_seconds, 600.0),
+        )
+
+    def set_phase(self, phase: str, reset_decode: bool = False) -> dict[str, Any]:
+        return self.request(
+            {
+                "command": "phase",
+                "phase": phase,
+                "reset_decode": reset_decode,
+            }
         )
 
     def prefetch(self, layer: int, experts: list[int]) -> dict[str, Any]:

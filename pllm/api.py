@@ -165,9 +165,22 @@ def create_app(controller: PLLMController, storage: Storage) -> Flask:
             return response, status_code
 
         replay_id = storage.create_replay(payload, "running")
+        try:
+            controller.prepare_inference_request(replay_id)
+        except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
+            controller.mark_inference_phase("idle", request_id=replay_id)
+            storage.update_replay(replay_id, "queued", error=str(exc))
+            response, status_code = _openai_error(
+                f"PLLM could not restore full prefill residency; replay_id={replay_id}",
+                503,
+            )
+            response.headers["X-PLLM-Replay-ID"] = replay_id
+            return response, status_code
         if payload.get("stream"):
-            return _stream_chat(target, payload, replay_id, storage)
-        return _plain_chat(target, payload, replay_id, storage)
+            return _stream_chat(target, payload, replay_id, storage, controller)
+        result = _plain_chat(target, payload, replay_id, storage)
+        controller.mark_inference_phase("idle", request_id=replay_id)
+        return result
 
     @app.post("/api/v1/replays/<replay_id>")
     def replay(replay_id: str):
@@ -182,7 +195,15 @@ def create_app(controller: PLLMController, storage: Storage) -> Flask:
         payload = dict(entry["request"])
         payload["stream"] = False
         storage.update_replay(replay_id, "running")
-        return _plain_chat(target, payload, replay_id, storage)
+        try:
+            controller.prepare_inference_request(replay_id)
+        except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
+            controller.mark_inference_phase("idle", request_id=replay_id)
+            storage.update_replay(replay_id, "queued", error=str(exc))
+            return jsonify({"error": str(exc)}), 503
+        result = _plain_chat(target, payload, replay_id, storage)
+        controller.mark_inference_phase("idle", request_id=replay_id)
+        return result
 
     @app.errorhandler(404)
     def not_found(_error):
@@ -220,7 +241,11 @@ def _plain_chat(
 
 
 def _stream_chat(
-    target: str, payload: dict[str, Any], replay_id: str, storage: Storage
+    target: str,
+    payload: dict[str, Any],
+    replay_id: str,
+    storage: Storage,
+    controller: PLLMController,
 ) -> Response:
     try:
         upstream = requests.post(
@@ -231,6 +256,7 @@ def _stream_chat(
         )
         upstream.raise_for_status()
     except requests.RequestException as exc:
+        controller.mark_inference_phase("idle", request_id=replay_id)
         storage.update_replay(replay_id, "aborted", error=str(exc))
         result, status = _openai_error(
             f"vLLM stream could not start; replay_id={replay_id}", 502
@@ -241,6 +267,7 @@ def _stream_chat(
     def generate() -> Iterator[bytes]:
         captured: list[str] = []
         generated_tokens = 0
+        decode_marked = False
         try:
             for line in upstream.iter_lines():
                 if not line:
@@ -252,6 +279,11 @@ def _stream_chat(
                         delta = event["choices"][0].get("delta", {})
                         content = delta.get("content")
                         if content:
+                            if not decode_marked:
+                                controller.mark_inference_phase(
+                                    "decode", request_id=replay_id
+                                )
+                                decode_marked = True
                             captured.append(str(content))
                             generated_tokens += 1
                             storage.update_replay_progress(
@@ -276,6 +308,7 @@ def _stream_chat(
             yield f"data: {json.dumps(error)}\n\n".encode()
         finally:
             upstream.close()
+            controller.mark_inference_phase("idle", request_id=replay_id)
 
     response = Response(
         stream_with_context(generate()),

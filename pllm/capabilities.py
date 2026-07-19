@@ -87,7 +87,7 @@ class CapabilityProbe:
                 "mock_same_stream_validated": True,
                 "real_model_validated": continuity["validated"],
                 "validation_result": continuity["path"],
-                "hybrid_state_strategy": "connector_attention_plus_token_recompute",
+                "hybrid_state_strategy": "connector_attention_and_mamba_state_island",
             },
         }
         self._last_probe = now

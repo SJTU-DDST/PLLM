@@ -8,6 +8,7 @@ from typing import Any
 from .config import PLLMConfig
 from .expert_catalog import ExpertCatalog
 from .expert_residency import ResidencyPlanner, ResourceEnvelope
+from .decode_residency import DecodeResidencyGuardrail
 from .models import SensorSnapshot, WorkloadClass
 
 
@@ -50,6 +51,7 @@ class ExpertResidencyControlPlane:
         self._error = ""
         self._last_plan: dict[str, Any] = {}
         self._last_updated_at = 0.0
+        self._last_decode_plan: dict[str, Any] = {}
         self._load_catalog()
 
     def _load_catalog(self) -> None:
@@ -95,9 +97,64 @@ class ExpertResidencyControlPlane:
                     ),
                 },
                 "plan": dict(self._last_plan),
+                "decode_plan": dict(self._last_decode_plan),
                 "updated_at": self._last_updated_at,
                 "guardrail": "recommendation_only_no_vllm_weight_mutation",
             }
+
+    def plan_decode_residency(self, runtime: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._catalog is None:
+                return {}
+            catalog = self._catalog
+            trace = dict(runtime.get("route_trace") or {})
+            phase = str(trace.get("phase", "idle"))
+            observations = int(trace.get("decode_observations", 0))
+            rates = {
+                int(slots): float(rate)
+                for slots, rate in dict(
+                    trace.get("projected_byte_hit_rate") or {}
+                ).items()
+            }
+            if phase == "decode" and observations < self.config.decode_min_route_observations:
+                plan = {
+                    "action": "observe",
+                    "slots_per_layer": catalog.experts_per_layer,
+                    "projected_byte_hit_rate": max(rates.values(), default=0.0),
+                    "estimated_slowdown_ratio": None,
+                    "reason": (
+                        "decode route window is warming: "
+                        f"{observations}/{self.config.decode_min_route_observations} observations"
+                    ),
+                    "evidence": "insufficient_live_decode_route_window",
+                    **catalog.project_slots(catalog.experts_per_layer),
+                }
+                self._last_decode_plan = plan
+                return dict(plan)
+
+            guardrail = DecodeResidencyGuardrail(
+                catalog.active_expert_bytes_per_token / 1024**3,
+                all_miss_objects_per_token=(
+                    len(catalog.moe_layers) * catalog.active_experts_per_token
+                ),
+                miss_latency_p95_ms=self.config.decode_miss_latency_p95_ms,
+                minimum_byte_hit_rate=self.config.decode_min_byte_hit_rate,
+                maximum_slowdown_ratio=self.config.decode_max_slowdown_ratio,
+            )
+            decision = guardrail.choose(
+                phase,
+                rates,
+                self.config.decode_candidate_slots,
+                self.config.expert_io_budget_gib_s,
+                self.config.expert_requested_token_rate,
+                self.config.decode_baseline_tpot_ms,
+                full_slots=catalog.experts_per_layer,
+            ).to_dict()
+            decision.update(catalog.project_slots(decision["slots_per_layer"]))
+            decision["observations"] = observations
+            decision["latency_guardrail"] = "strictly_below_10x"
+            self._last_decode_plan = decision
+            return dict(decision)
 
     def recommend(
         self, snapshot: SensorSnapshot, workload: WorkloadClass

@@ -18,6 +18,14 @@ export VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 
+if [[ -n "${PLLM_EER_RDMA_POOL_INDEX:-}" ]]; then
+  if [[ ! -r "${PLLM_EER_RDMA_POOL_INDEX}" ]]; then
+    echo "RDMA warm-profile index is not readable: ${PLLM_EER_RDMA_POOL_INDEX}" >&2
+    exit 1
+  fi
+  export PLLM_EER_RDMA_POOL_BINARY="${PLLM_EER_RDMA_POOL_BINARY:-${PWD}/rdma_bridge/build/pllm-rdma-pool}"
+fi
+
 HIBERCACHE_DIR="${HIBERCACHE_DIR:-/mnt/ssd-storage/pllm-cache}"
 mkdir -p "${HIBERCACHE_DIR}"
 KV_TRANSFER_CONFIG="$(printf '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":536870912,"eviction_policy":"arc","secondary_tiers":[{"type":"fs","root_dir":"%s","n_read_threads":8,"n_write_threads":4}]}}' "${HIBERCACHE_DIR}")"

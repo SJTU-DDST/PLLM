@@ -65,6 +65,7 @@ class PLLMController:
         self._thread: threading.Thread | None = None
         self._last_service_refresh = 0.0
         self._last_expert_resize_at = 0.0
+        self._inference_phases: dict[str, str] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -121,6 +122,12 @@ class PLLMController:
             return self.expert_runtime.status()
         if self.config.dry_run:
             raise RuntimeError("dry-run mode cannot mutate the expert data plane")
+        if action == "set_phase":
+            result = self.expert_runtime.set_phase(
+                str(payload.get("phase", "idle")),
+                bool(payload.get("reset_decode", False)),
+            )
+            return result
         if action not in {"prefetch", "evict", "resize", "evict_all"}:
             raise ValueError(f"unknown expert data-plane action: {action}")
 
@@ -139,7 +146,12 @@ class PLLMController:
                     slots = int(payload.get("slots_per_layer", 0))
                     if slots < 22:
                         raise ValueError("slots_per_layer cannot be below Top-22")
-                    result = self.expert_runtime.resize(slots)
+                    if payload.get("phase"):
+                        self.expert_runtime.set_phase(str(payload["phase"]))
+                    result = self.expert_runtime.resize(
+                        slots,
+                        retain_policy=str(payload.get("retain_policy", "lru")),
+                    )
                 elif action == "prefetch":
                     result = self.expert_runtime.prefetch(
                         int(payload["layer"]),
@@ -299,6 +311,70 @@ class PLLMController:
 
     def proxy_target(self) -> str | None:
         return self.manager.target_url()
+
+    def mark_inference_phase(
+        self,
+        phase: str,
+        reset_decode: bool = False,
+        request_id: str = "",
+    ) -> None:
+        normalized = phase.strip().lower()
+        if normalized not in {"idle", "prefill", "decode"}:
+            raise ValueError(f"invalid inference phase: {phase}")
+        effective_reset = reset_decode
+        if request_id:
+            with self._status_lock:
+                was_idle = not self._inference_phases
+                if normalized == "idle":
+                    self._inference_phases.pop(request_id, None)
+                else:
+                    self._inference_phases[request_id] = normalized
+                phases = set(self._inference_phases.values())
+                normalized = (
+                    "prefill"
+                    if "prefill" in phases
+                    else "decode"
+                    if "decode" in phases
+                    else "idle"
+                )
+                effective_reset = reset_decode and was_idle
+        runtime = self.expert_runtime.status()
+        if not runtime.get("online"):
+            return
+        try:
+            self.expert_runtime.set_phase(
+                normalized, reset_decode=effective_reset
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            LOGGER.debug("Could not update EER inference phase: %s", exc)
+
+    def prepare_inference_request(self, request_id: str) -> None:
+        """Restore full expert residency before forwarding a new prefill."""
+        self.mark_inference_phase(
+            "prefill", reset_decode=True, request_id=request_id
+        )
+        runtime = self.expert_runtime.status()
+        if not (
+            self.config.expert_data_plane_enabled
+            and runtime.get("online")
+            and runtime.get("data_plane_ready")
+        ):
+            return
+        layers = runtime.get("data_plane", {}).get("layers", [])
+        full_slots = max(
+            (int(layer.get("global_experts", 0)) for layer in layers),
+            default=0,
+        )
+        current_slots = int(runtime.get("slots_per_layer", 0))
+        if full_slots > 0 and current_slots < full_slots:
+            self.expert_dataplane_action(
+                {
+                    "action": "resize",
+                    "slots_per_layer": full_slots,
+                    "retain_policy": "lru",
+                    "phase": "prefill",
+                }
+            )
 
     def refresh_services(self) -> list[dict[str, Any]]:
         services = self.manager.refresh()
@@ -515,6 +591,12 @@ class PLLMController:
     def _expert_status(self) -> dict[str, Any]:
         projection = self.expert_residency.status()
         runtime = self.expert_runtime.status()
+        with self._status_lock:
+            projection["active_inference_requests"] = len(self._inference_phases)
+            projection["request_phases"] = dict(self._inference_phases)
+        projection["decode_plan"] = self.expert_residency.plan_decode_residency(
+            runtime
+        )
         projection["data_plane"] = runtime
         if runtime.get("data_plane_ready"):
             projection["data_plane_ready"] = True
@@ -537,10 +619,22 @@ class PLLMController:
             and expert_status.get("data_plane_ready")
         ):
             return False
-        plan = expert_status.get("plan") or {}
-        if plan.get("action") not in {"elastic_resident", "full_resident"}:
+        capacity_plan = expert_status.get("plan") or {}
+        decode_plan = expert_status.get("decode_plan") or {}
+        if capacity_plan.get("action") not in {"elastic_resident", "full_resident"}:
             return False
-        desired = int(plan.get("slots_per_layer", 0))
+        if capacity_plan.get("action") == "elastic_resident":
+            if not self.config.decode_elastic_enabled:
+                return False
+            if decode_plan.get("action") != "decode_elastic":
+                return False
+            desired = int(decode_plan.get("slots_per_layer", 0))
+            retain_policy = "decode_hot"
+        else:
+            desired = int(
+                expert_status.get("model", {}).get("experts_per_layer", 0)
+            )
+            retain_policy = "lru"
         if desired < 22:
             return False
         layers = (
@@ -557,7 +651,11 @@ class PLLMController:
         ):
             return False
         self.expert_dataplane_action(
-            {"action": "resize", "slots_per_layer": desired}
+            {
+                "action": "resize",
+                "slots_per_layer": desired,
+                "retain_policy": retain_policy,
+            }
         )
         return True
 

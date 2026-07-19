@@ -11,6 +11,7 @@ class FakeController:
         self.target = target
         self.active = active
         self.action_calls = []
+        self.phase_calls = []
 
     def status(self):
         return {
@@ -76,10 +77,17 @@ class FakeController:
     def proxy_target(self):
         return self.target
 
+    def mark_inference_phase(self, phase, reset_decode=False, request_id=""):
+        self.phase_calls.append((phase, reset_decode, request_id))
+
+    def prepare_inference_request(self, request_id):
+        self.mark_inference_phase("prefill", True, request_id)
+
 
 def test_proxy_records_completed_request(mock_vllm_url: str, tmp_path: Path) -> None:
     storage = Storage(tmp_path / "events.sqlite3")
-    app = create_app(FakeController(mock_vllm_url), storage)
+    controller = FakeController(mock_vllm_url)
+    app = create_app(controller, storage)
     client = app.test_client()
 
     response = client.post(
@@ -93,6 +101,13 @@ def test_proxy_records_completed_request(mock_vllm_url: str, tmp_path: Path) -> 
     assert replay is not None
     assert replay["status"] == "completed"
     assert replay["response_text"] == "Mock response: hello"
+    assert [(phase, reset) for phase, reset, _ in controller.phase_calls] == [
+        ("prefill", True),
+        ("idle", False),
+    ]
+    assert {request_id for _, _, request_id in controller.phase_calls} == {
+        replay_id
+    }
 
 
 def test_paused_proxy_queues_replay(mock_vllm_url: str, tmp_path: Path) -> None:
@@ -209,7 +224,8 @@ def test_stream_persists_incremental_output(
     mock_vllm_url: str, tmp_path: Path
 ) -> None:
     storage = Storage(tmp_path / "events.sqlite3")
-    app = create_app(FakeController(mock_vllm_url), storage)
+    controller = FakeController(mock_vllm_url)
+    app = create_app(controller, storage)
     client = app.test_client()
 
     response = client.post(
@@ -228,3 +244,8 @@ def test_stream_persists_incremental_output(
     assert replay["status"] == "completed"
     assert replay["generated_tokens"] > 0
     assert replay["response_text"] == "Mock response: stream me "
+    assert [(phase, reset) for phase, reset, _ in controller.phase_calls] == [
+        ("prefill", True),
+        ("decode", False),
+        ("idle", False),
+    ]

@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -42,7 +43,7 @@ constexpr std::size_t kTransferChunk = 8ULL * 1024 * 1024;
 constexpr std::uint64_t kDefaultPoolBytes = 16ULL * 1024 * 1024 * 1024;
 constexpr std::uint64_t kDefaultSlotBytes = 3ULL * 1024 * 1024;
 
-enum class Operation : std::uint16_t { Put = 1, Get = 2 };
+enum class Operation : std::uint16_t { Put = 1, Get = 2, StreamGet = 3 };
 
 struct Options {
   bool server = false;
@@ -101,9 +102,16 @@ struct SlotHeaderWire {
   std::uint64_t committed;
   std::array<std::uint8_t, kHeaderBytes - 40> reserved;
 };
+
+struct StreamResponseWire {
+  std::uint32_t status;
+  std::uint64_t payload_size;
+  std::uint32_t message_size;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(SlotHeaderWire) == kHeaderBytes);
+static_assert(sizeof(StreamResponseWire) == 16);
 
 struct IndexEntry {
   std::uint64_t slot = 0;
@@ -150,6 +158,38 @@ void recv_all(int socket_fd, void* data, std::size_t size) {
     if (received == 0) throw std::runtime_error("peer closed while receiving");
     cursor += received;
     size -= static_cast<std::size_t>(received);
+  }
+}
+
+bool read_fd_all(int fd, void* data, std::size_t size, bool allow_eof = false) {
+  auto* cursor = static_cast<std::byte*>(data);
+  std::size_t received = 0;
+  while (received < size) {
+    const ssize_t count = ::read(fd, cursor + received, size - received);
+    if (count < 0) {
+      if (errno == EINTR) continue;
+      system_error("read stream protocol");
+    }
+    if (count == 0) {
+      if (allow_eof && received == 0) return false;
+      throw std::runtime_error("short stream protocol read");
+    }
+    received += static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
+void write_fd_all(int fd, const void* data, std::size_t size) {
+  const auto* cursor = static_cast<const std::byte*>(data);
+  while (size > 0) {
+    const ssize_t count = ::write(fd, cursor, size);
+    if (count < 0) {
+      if (errno == EINTR) continue;
+      system_error("write stream protocol");
+    }
+    if (count == 0) throw std::runtime_error("short stream protocol write");
+    cursor += count;
+    size -= static_cast<std::size_t>(count);
   }
 }
 
@@ -530,7 +570,8 @@ Options parse_options(int argc, char** argv) {
       const auto operation = value();
       if (operation == "put") options.operation = Operation::Put;
       else if (operation == "get") options.operation = Operation::Get;
-      else throw std::runtime_error("operation must be put or get");
+      else if (operation == "stream-get") options.operation = Operation::StreamGet;
+      else throw std::runtime_error("operation must be put, get, or stream-get");
     } else if (argument == "--index") options.index_file = value();
     else if (argument == "--root") options.root = value();
     else if (argument == "--device") options.device = value();
@@ -547,7 +588,9 @@ Options parse_options(int argc, char** argv) {
       std::cout
           << "pllm-rdma-pool --server [--pool-bytes N] [--slot-bytes N]\n"
              "pllm-rdma-pool --client HOST --operation put|get --index FILE "
-             "--root DIR [--queue-depth N] [--rd-atomic-depth N]\n";
+             "--root DIR [--queue-depth N] [--rd-atomic-depth N]\n"
+             "pllm-rdma-pool --client HOST --operation stream-get "
+             "--index FILE [--allocator cuda-host]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown argument: " + argument);
@@ -556,8 +599,12 @@ Options parse_options(int argc, char** argv) {
   if (options.server == !options.client.empty()) {
     throw std::runtime_error("select exactly one of --server or --client");
   }
-  if (!options.server && (options.index_file.empty() || options.root.empty())) {
-    throw std::runtime_error("client requires --index and --root");
+  if (!options.server && options.index_file.empty()) {
+    throw std::runtime_error("client requires --index");
+  }
+  if (!options.server && options.operation != Operation::StreamGet &&
+      options.root.empty()) {
+    throw std::runtime_error("put/get client requires --root");
   }
   if (options.allocator != "aligned" && options.allocator != "cuda-host") {
     throw std::runtime_error("allocator must be aligned or cuda-host");
@@ -781,6 +828,142 @@ void validate_header(const SlotHeaderWire& header, const IndexEntry& entry) {
   }
 }
 
+void finish_session(int socket_fd) {
+  std::uint8_t done = 1;
+  send_all(socket_fd, &done, sizeof(done));
+  recv_all(socket_fd, &done, sizeof(done));
+  if (done != 1) throw std::runtime_error("server did not commit pool session");
+}
+
+void write_stream_response(std::uint32_t status, const void* payload,
+                           std::size_t payload_size,
+                           std::string_view message = {}) {
+  const StreamResponseWire response{
+      htonl(status), htobe64(payload_size),
+      htonl(static_cast<std::uint32_t>(message.size()))};
+  write_fd_all(STDOUT_FILENO, &response, sizeof(response));
+  if (!message.empty()) {
+    write_fd_all(STDOUT_FILENO, message.data(), message.size());
+  }
+  if (payload_size > 0) {
+    write_fd_all(STDOUT_FILENO, payload, payload_size);
+  }
+}
+
+int run_stream_get(const Options& options, const std::vector<IndexEntry>& rows,
+                   std::uint64_t slot_bytes, std::uint64_t slot_count,
+                   int socket_fd) {
+  std::unordered_map<std::string, const IndexEntry*> by_key;
+  for (const auto& row : rows) {
+    if (row.slot >= slot_count || row.size == 0 || row.size > slot_bytes) {
+      throw std::runtime_error("index entry exceeds remote pool geometry");
+    }
+    by_key.emplace(row.key.generic_string(), &row);
+  }
+  const std::size_t data_region =
+      static_cast<std::size_t>(slot_bytes) * options.queue_depth;
+  const std::size_t header_region = kHeaderBytes * options.queue_depth;
+  HostBuffer staging(data_region + header_region,
+                     options.allocator == "cuda-host", false);
+  RdmaEndpoint endpoint(options, staging);
+  exchange_connections(socket_fd, endpoint);
+  const std::uint64_t stride = kHeaderBytes + slot_bytes;
+  std::uint64_t objects = 0;
+  std::uint64_t payload_bytes = 0;
+
+  while (true) {
+    std::uint32_t encoded_size = 0;
+    if (!read_fd_all(STDIN_FILENO, &encoded_size, sizeof(encoded_size), true)) {
+      break;
+    }
+    const std::uint32_t first = ntohl(encoded_size);
+    if (first == 0) break;
+    std::uint32_t count = 1;
+    std::vector<std::string> keys;
+    if (first == UINT32_MAX) {
+      std::uint32_t encoded_count = 0;
+      read_fd_all(STDIN_FILENO, &encoded_count, sizeof(encoded_count));
+      count = ntohl(encoded_count);
+      if (count == 0 || count > options.queue_depth) {
+        throw std::runtime_error("stream batch exceeds queue depth");
+      }
+    }
+    keys.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+      std::uint32_t key_size = first;
+      if (first == UINT32_MAX) {
+        std::uint32_t encoded_key_size = 0;
+        read_fd_all(STDIN_FILENO, &encoded_key_size, sizeof(encoded_key_size));
+        key_size = ntohl(encoded_key_size);
+      }
+      if (key_size == 0 || key_size > 4096) {
+        throw std::runtime_error("stream key exceeds 1-4096 bytes");
+      }
+      std::string key(key_size, '\0');
+      read_fd_all(STDIN_FILENO, key.data(), key.size());
+      keys.push_back(std::move(key));
+    }
+    try {
+      std::vector<const IndexEntry*> resolved;
+      resolved.reserve(keys.size());
+      for (const auto& key : keys) {
+        const auto found = by_key.find(key);
+        resolved.push_back(found == by_key.end() ? nullptr : found->second);
+      }
+      std::vector<std::size_t> valid;
+      for (std::size_t index = 0; index < resolved.size(); ++index) {
+        if (resolved[index] != nullptr) valid.push_back(index);
+      }
+      for (std::size_t item = 0; item < valid.size(); ++item) {
+        const auto& row = *resolved[valid[item]];
+        endpoint.post_read(data_region + item * kHeaderBytes,
+                           row.slot * stride, sizeof(SlotHeaderWire), false);
+      }
+      for (std::size_t item = 0; item < valid.size(); ++item) {
+        const auto& row = *resolved[valid[item]];
+        endpoint.post_read(item * slot_bytes,
+                           row.slot * stride + kHeaderBytes,
+                           static_cast<std::size_t>(row.size),
+                           item + 1 == valid.size());
+      }
+      if (!valid.empty()) endpoint.poll(1);
+      for (std::size_t item = 0; item < valid.size(); ++item) {
+        SlotHeaderWire header{};
+        std::memcpy(&header,
+                    static_cast<std::byte*>(staging.data()) + data_region +
+                        item * kHeaderBytes,
+                    sizeof(header));
+        validate_header(header, *resolved[valid[item]]);
+      }
+      std::size_t valid_item = 0;
+      for (const auto* row : resolved) {
+        if (row == nullptr) {
+          write_stream_response(1, nullptr, 0,
+                                "key is absent from the warm profile");
+          continue;
+        }
+        write_stream_response(0,
+                              static_cast<std::byte*>(staging.data()) +
+                                  valid_item * slot_bytes,
+                              static_cast<std::size_t>(row->size));
+        ++objects;
+        payload_bytes += row->size;
+        ++valid_item;
+      }
+    } catch (const std::exception& error) {
+      for (std::size_t index = 0; index < keys.size(); ++index) {
+        write_stream_response(1, nullptr, 0, error.what());
+      }
+    }
+  }
+  finish_session(socket_fd);
+  std::cerr << "{\"ready\":true,\"operation\":\"stream-get\","
+            << "\"objects\":" << objects << ",\"bytes\":" << payload_bytes
+            << ",\"persistent_qp\":true,\"remote_disk_io\":false,"
+               "\"local_disk_io\":false,\"gpudirect_claimed\":false}\n";
+  return 0;
+}
+
 int run_server(const Options& options) {
   const std::uint64_t stride = kHeaderBytes + options.slot_bytes;
   const std::uint64_t slot_count = options.pool_bytes / stride;
@@ -831,6 +1014,10 @@ int run_client(const Options& options) {
   const std::uint64_t pool_bytes = be64toh(info.pool_bytes);
   const std::uint64_t slot_bytes = be64toh(info.slot_bytes);
   const std::uint64_t slot_count = be64toh(info.slot_count);
+  if (options.operation == Operation::StreamGet) {
+    return run_stream_get(
+        options, rows, slot_bytes, slot_count, socket_fd.get());
+  }
   for (const auto& row : rows) {
     if (row.slot >= slot_count || row.size == 0 || row.size > slot_bytes) {
       throw std::runtime_error("index entry exceeds remote pool geometry");
@@ -922,10 +1109,7 @@ int run_client(const Options& options) {
     }
   }
   std::cerr << "\n";
-  std::uint8_t done = 1;
-  send_all(socket_fd.get(), &done, sizeof(done));
-  recv_all(socket_fd.get(), &done, sizeof(done));
-  if (done != 1) throw std::runtime_error("server did not commit pool session");
+  finish_session(socket_fd.get());
   const double seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - started).count();
   const double gbps = seconds > 0 ? payload_bytes * 8.0 / seconds / 1e9 : 0.0;

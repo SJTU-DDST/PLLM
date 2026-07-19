@@ -17,12 +17,13 @@ const EMPTY_STATUS = {
 };
 
 const DEMO_STEPS = [
-  { state: "active", workload: "idle", reason: "Nemotron 完整驻留，后台生成 CUDA 代码", gpu: 68, mem: 28, progress: 0, token: 184, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, miss: 0, rate: 5 } },
-  { state: "elastic_resident", workload: "creative", reason: "Blender 前台激活，建议收缩到 256 slots/layer", gpu: 52, mem: 49, progress: 34, token: 193, expert: { action: "elastic_resident", slots: 256, resident: 45.251, reclaim: 29.531, miss: 0.444, rate: 1.75 } },
-  { state: "elastic_resident", workload: "creative", reason: "前台容量继续上升，收缩到 128 slots/layer", gpu: 37, mem: 67, progress: 68, token: 197, expert: { action: "elastic_resident", slots: 128, resident: 30.486, reclaim: 44.297, miss: 0.78, rate: 1.0 } },
-  { state: "hibernated", workload: "memory_pressure", reason: "预计 miss 流量越过 I/O 包络，转为事务式休眠", gpu: 8, mem: 18, progress: 100, token: 197, reclaimed: 74.1, expert: { action: "hibernate", slots: 0, resident: 0, reclaim: 74.783, miss: 0, rate: 0 } },
-  { state: "restoring", workload: "idle", reason: "前台退出，从本地 NVMe 渐进恢复 expert slots", gpu: 34, mem: 24, progress: 63, token: 197, reclaimed: 74.1, expert: { action: "elastic_resident", slots: 128, resident: 30.486, reclaim: 44.297, miss: 0.31, rate: 1.0 } },
-  { state: "active", workload: "idle", reason: "恢复完整驻留，请求从 token 197 继续", gpu: 61, mem: 27, progress: 100, token: 221, reclaimed: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, miss: 0, rate: 5 } },
+  { state: "active", workload: "idle", reason: "Prefill 全驻留：Nemotron 正在生成 CUDA 代码", gpu: 68, mem: 28, progress: 0, token: 184, phase: "prefill", observations: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
+  { state: "yielding", workload: "creative", reason: "Blender 激活；prefill 护栏先在 token 边界冻结，不驱逐专家", gpu: 52, mem: 49, progress: 22, token: 193, phase: "prefill", observations: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
+  { state: "active", workload: "creative", reason: "进入 decode，采集 320 个 layer-step 路由观测", gpu: 48, mem: 46, progress: 38, token: 201, phase: "decode", observations: 320, expert: { action: "observe", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
+  { state: "elastic_resident", workload: "creative", reason: "候选轨迹：496 slots 通过命中率与延迟护栏，状态小岛保持原位", gpu: 41, mem: 51, progress: 72, token: 215, phase: "decode", observations: 880, expert: { action: "decode_elastic", slots: 496, resident: 72.937, reclaim: 1.846, hit: 0.988, slowdown: 1.61 } },
+  { state: "hibernated", workload: "memory_pressure", reason: "若 1.85 GiB 不足且所有档位超预算，则拒绝抖动并升级 Level 2", gpu: 8, mem: 18, progress: 100, token: 215, phase: "idle", observations: 880, reclaimed: 72.0, expert: { action: "yield", slots: 512, resident: 74.783, reclaim: 0, hit: 0.988, slowdown: null } },
+  { state: "restoring", workload: "idle", reason: "前台退出；优先从 Remote DRAM 暖源恢复，NVMe 仅回退", gpu: 34, mem: 24, progress: 63, token: 215, phase: "idle", observations: 0, reclaimed: 72.0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
+  { state: "active", workload: "idle", reason: "恢复完整驻留，请求从 token 215 继续", gpu: 61, mem: 27, progress: 100, token: 239, phase: "decode", observations: 320, reclaimed: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
 ];
 
 createApp({
@@ -64,7 +65,7 @@ createApp({
       return !this.judgeMode && (this.activeStatus.services || []).some((service) => String(service.model || "").startsWith("mock-"));
     },
     dataModeLabel() {
-      if (this.judgeMode) return "HISTORICAL REPLAY";
+      if (this.judgeMode) return "SCENARIO REPLAY · NOT MEASURED";
       return this.mockBackend ? "LIVE SENSORS · MOCK BACKEND" : "LIVE CONTROL";
     },
     headline() {
@@ -74,7 +75,7 @@ createApp({
     },
     foregroundName() {
       const foreground = this.sensor.foreground || {};
-      if (this.judgeMode) return this.demoIndex >= 1 && this.demoIndex <= 3 ? "Blender" : "GNOME Desktop";
+      if (this.judgeMode) return this.demoIndex >= 1 && this.demoIndex <= 4 ? "Blender" : "GNOME Desktop";
       return foreground.wm_class || foreground.app_id || foreground.title || "未识别";
     },
     memoryMetric() {
@@ -90,9 +91,15 @@ createApp({
       return Math.max(0, Math.min(100, raw <= 1 ? raw * 100 : raw));
     },
     expertResidency() { return this.activeStatus.expert_residency || {}; },
-    expertPlan() { return this.expertResidency.plan || {}; },
+    capacityPlan() { return this.expertResidency.plan || {}; },
+    decodePlan() { return this.expertResidency.decode_plan || {}; },
+    expertPlan() {
+      return this.decodePlan.action ? this.decodePlan : this.capacityPlan;
+    },
     expertModel() { return this.expertResidency.model || {}; },
     expertDataPlane() { return this.expertResidency.data_plane || {}; },
+    routeTrace() { return this.expertDataPlane.route_trace || {}; },
+    stateIsland() { return this.expertDataPlane.state_island || {}; },
     expertActiveSlots() {
       if (this.expertResidency.data_plane_ready) {
         return Number(this.expertDataPlane.slots_per_layer ?? 0);
@@ -101,7 +108,7 @@ createApp({
     },
     expertEvidenceLabel() {
       if (this.expertResidency.data_plane_ready) return "LIVE DATA PLANE";
-      if (this.judgeMode) return "SIMULATED EER · HISTORICAL REPLAY";
+      if (this.judgeMode) return "SCENARIO · NOT MEASURED";
       return "CONTROL PLANE ONLY";
     },
     expertLayerCells() {
@@ -116,12 +123,14 @@ createApp({
       const hiber = this.activeStatus.hibercache || {};
       const rdma = caps.rdma || {};
       const devices = rdma.devices || [];
-      const selected = this.activeStatus.restore_source || "local_nvme";
+      const selected = this.activeStatus.restore_source || "remote_dram";
+      const islandBytes = Number(this.stateIsland.allocated_bytes || 0);
+      const sourceActive = ["quiescing", "hibernated", "restoring"].includes(this.activeStatus.state);
       return [
-        { role: "TIER 0", name: this.sensor.uma ? "GB10 UMA" : "GPU VRAM", icon: "cpu", detail: this.sensor.gpu_name || "NVIDIA GPU", value: this.sensor.uma ? "coherent" : this.metric(this.sensor.gpu_memory_used_gb, " GiB", 1), selected: ["active", "elastic_resident"].includes(this.activeStatus.state), available: !!this.sensor.gpu_available, linkActive: ["elastic_resident", "yielding", "quiescing", "restoring"].includes(this.activeStatus.state) },
-        { role: "TIER 1", name: "Pinned staging", icon: "memory-stick", detail: "cudaHostAlloc / 512 MiB", value: "512 MiB", selected: selected === "host_staging", available: true, linkActive: ["quiescing", "restoring"].includes(this.activeStatus.state) },
-        { role: "TIER 2", name: "Local NVMe", icon: "hard-drive", detail: hiber.root || "/mnt/ssd-storage/pllm-cache", value: this.metric(hiber.used_gb, " GiB", 2), selected: selected === "local_nvme", available: hiber.enabled !== false, linkActive: selected === "rdma_host_staged" },
-        { role: "TIER 3", name: "ConnectX-7", icon: "network", detail: devices[0] ? `${devices[0].name} · ${devices[0].rate}` : "host-staged RDMA", value: devices.length ? "ready" : "fallback", selected: selected === "rdma_host_staged", available: devices.length > 0, linkActive: false },
+        { role: "ACTIVE", name: this.sensor.uma ? "Local UMA" : "GPU VRAM", icon: "cpu", detail: "非专家权重 + decode 热专家", value: this.sensor.uma ? "coherent" : this.metric(this.sensor.gpu_memory_used_gb, " GiB", 1), selected: ["active", "elastic_resident"].includes(this.activeStatus.state), available: !!this.sensor.gpu_available, linkActive: ["elastic_resident", "yielding", "quiescing", "restoring"].includes(this.activeStatus.state) },
+        { role: "LIVE STATE", name: "KV / Mamba island", icon: "memory-stick", detail: "专家 resize 前后 allocation 不变", value: islandBytes ? this.metric(islandBytes / 1024 / 1024, " MiB", 0) : "guarded", selected: ["active", "elastic_resident", "yielding"].includes(this.activeStatus.state), available: this.stateIsland.attached !== false, linkActive: ["quiescing", "restoring"].includes(this.activeStatus.state) },
+        { role: "WARM SOURCE", name: "Remote DRAM", icon: "network", detail: devices[0] ? `${devices[0].name} · ${devices[0].rate} · host staged` : "ConnectX host-staged RDMA", value: devices.length ? "ready" : "fallback", selected: sourceActive && selected === "remote_dram", available: devices.length > 0, linkActive: sourceActive && selected === "local_nvme" },
+        { role: "FALLBACK", name: "Local NVMe", icon: "hard-drive", detail: hiber.root || "/mnt/ssd-storage/pllm-cache", value: this.metric(hiber.used_gb, " GiB", 2), selected: sourceActive && selected === "local_nvme", available: hiber.enabled !== false, linkActive: false },
       ];
     },
     costRows() {
@@ -148,13 +157,13 @@ createApp({
       const loader = caps.sparkload || {};
       const patch = caps.vllm?.hibercache_patch || {};
       const rdma = caps.rdma || {};
-      const liveState = caps.hibercache?.live_state_store || {};
+      const stateIsland = caps.hibercache?.active_state_island || {};
       return [
         { name: "vLLM Sleep Mode", ready: caps.vllm?.version === "0.25.1", detail: caps.vllm?.version || "not detected" },
         { name: "HiberCache patch", ready: !!patch.installed, detail: patch.installed ? "guarded · GPU validation pending" : "token recompute fallback" },
         { name: "SparkLoad", ready: !!loader.fastsafetensors_version, detail: loader.selected || "multithread fallback" },
         { name: "Host-staged RDMA", ready: (rdma.devices || []).length > 0, detail: caps.cuda?.rdma_path === "host_staging" ? "host staging enforced" : `${(rdma.devices || []).length} device(s)` },
-        { name: "Live-state carrier", ready: !!liveState.serializer_attached, detail: liveState.serializer_attached ? `${liveState.transactions || 0} committed epochs` : "SSD/RDMA carrier · serializer pending" },
+        { name: "KV/Mamba state island", ready: stateIsland.weight_independent === true, detail: stateIsland.deep_sleep_exact_resume_validated ? "exact deep resume validated" : "decode resize isolated · deep resume pending" },
         { name: "Expert slot data plane", ready: !!this.expertResidency.data_plane_ready, detail: this.expertResidency.data_plane_ready ? "physical slots active" : "control-plane projection" },
         { name: "Nemotron continuity", ready: !!caps.continuity?.real_model_validated, detail: caps.continuity?.real_model_validated ? "greedy exact match" : "pending GPU experiment" },
       ];
@@ -163,7 +172,7 @@ createApp({
     displayExperiments() {
       if (!this.judgeMode) return this.experiments.slice(0, 5);
       return [
-        { id: "demo-1", name: "Level 2 release", variant: "historical replay", created_at: Date.now() / 1000, metrics: { reclaimed_ratio: 0.971, latency_ms: 2410 } },
+        { id: "demo-1", name: "Decode 496-slot policy", variant: "scenario · not measured", created_at: Date.now() / 1000, metrics: { projected_reclaim_gib: 1.846 } },
         { id: "demo-2", name: "stream continuity", variant: "mock validated", created_at: Date.now() / 1000 - 80, metrics: { duplicate_tokens: 0, missing_tokens: 0 } },
         ...this.experiments.slice(0, 3),
       ];
@@ -171,8 +180,8 @@ createApp({
     displayEvents() {
       if (!this.judgeMode) return this.events;
       return [
-        { id: "d1", event_type: "hibernate", reason: "Blender 前台压力触发 Level 2", created_at: Date.now() / 1000 - 22 },
-        { id: "d2", event_type: "wake", reason: "从 local NVMe 恢复请求", created_at: Date.now() / 1000 - 11 },
+        { id: "d1", event_type: "expert_dataplane", reason: "scenario: decode 496-slot candidate", created_at: Date.now() / 1000 - 22 },
+        { id: "d2", event_type: "wake", reason: "scenario: Remote DRAM warm restore", created_at: Date.now() / 1000 - 11 },
         ...this.events,
       ];
     },
@@ -180,6 +189,13 @@ createApp({
   },
   methods: {
     metric(value, suffix = "", precision = 0) { return value == null || Number.isNaN(Number(value)) ? "--" : `${Number(value).toFixed(precision)}${suffix}`; },
+    percent(value) { return value == null || Number.isNaN(Number(value)) ? "--" : `${(Number(value) * 100).toFixed(2)}%`; },
+    ratio(value) { return value == null || !Number.isFinite(Number(value)) ? "fallback" : `${Number(value).toFixed(2)}x`; },
+    formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (!bytes) return "--";
+      return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GiB` : `${(bytes / 1024 ** 2).toFixed(0)} MiB`;
+    },
     async api(path, options = {}) {
       const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
       const payload = await response.json().catch(() => ({}));
@@ -264,9 +280,9 @@ createApp({
       try {
         await this.api("/api/v1/expert-dataplane/actions", {
           method: "POST",
-          body: JSON.stringify({ action: "resize", slots_per_layer: slots }),
+          body: JSON.stringify({ action: "resize", slots_per_layer: slots, retain_policy: this.expertPlan.action === "decode_elastic" ? "decode_hot" : "lru" }),
         });
-        await this.refresh();
+        await Promise.all([this.pollStatus(), this.loadCapabilities(true)]);
         this.showToast("物理专家槽位已切换", "success");
       } catch (error) {
         this.showToast(error.message, "error");
@@ -293,7 +309,7 @@ createApp({
     stopJudgeDemo() { if (this.demoTimer) window.clearInterval(this.demoTimer); this.demoTimer = null; this.demoPlaying = false; },
     applyDemoStep(index) {
       const step = DEMO_STEPS[index];
-      this.replayStatus = { ...structuredClone(EMPTY_STATUS), state: step.state, workload: step.workload, reason: step.reason, transition_progress: step.progress, reclaimed_gb: step.reclaimed ?? null, last_action_duration_ms: step.state === "hibernated" ? 2410 : null, restore_source: "local_nvme", pause_mode: "keep", sleep_level: ["quiescing", "hibernated", "restoring"].includes(step.state) ? 2 : 0, sensor: { gpu_available: true, gpu_name: "NVIDIA GB10", gpu_util: step.gpu, memory_total_gb: 128, memory_available_gb: 128 - step.mem, power_watts: step.state === "hibernated" ? 42 : 87, uma: true, foreground: { wm_class: index >= 1 && index <= 3 ? "Blender" : "GNOME Desktop" } }, hibercache: { enabled: true, root: "/mnt/ssd-storage/pllm-cache", used_gb: 12.8 }, expert_residency: { available: true, backend: "control_plane_only", data_plane_ready: false, evidence: "historical_simulation", model: { moe_layers: 40, experts_per_layer: 512, top_k: 22, routed_expert_gib: 59.063, non_routed_gib: 15.72, average_expert_mib: 2.953 }, plan: { action: step.expert.action, slots_per_layer: step.expert.slots, projected_resident_gib: step.expert.resident, projected_reclaim_gib: step.expert.reclaim, estimated_miss_gib_s: step.expert.miss, token_rate_limit: step.expert.rate, exact_route_required: true, executable: false, data_plane_ready: false, evidence: "historical_simulation" } }, decision: { score: step.state === "yielding" ? 0.42 : 0.71, reason: step.reason, costs: { yield: step.state === "yielding" ? 0.42 : 2.84, hibernate: 0.71, restore_penalty: 0.12 } } };
+      this.replayStatus = { ...structuredClone(EMPTY_STATUS), state: step.state, workload: step.workload, reason: step.reason, transition_progress: step.progress, reclaimed_gb: step.reclaimed ?? null, last_action_duration_ms: null, restore_source: "remote_dram", pause_mode: "keep", sleep_level: ["quiescing", "hibernated", "restoring"].includes(step.state) ? 2 : 0, sensor: { gpu_available: true, gpu_name: "NVIDIA GB10", gpu_util: step.gpu, memory_total_gb: 128, memory_available_gb: 128 - step.mem, power_watts: step.state === "hibernated" ? 42 : 87, uma: true, foreground: { wm_class: index >= 1 && index <= 4 ? "Blender" : "GNOME Desktop" } }, hibercache: { enabled: true, root: "/mnt/ssd-storage/pllm-cache", used_gb: 12.8 }, expert_residency: { available: true, backend: "scenario_replay", data_plane_ready: false, evidence: "policy_scenario_not_measurement", model: { moe_layers: 40, experts_per_layer: 512, top_k: 22, routed_expert_gib: 59.063, non_routed_gib: 15.72, average_expert_mib: 2.953 }, plan: { action: "elastic_resident", slots_per_layer: step.expert.slots, evidence: "policy_scenario_not_measurement" }, decode_plan: { action: step.expert.action, slots_per_layer: step.expert.slots, resident_weight_gib: step.expert.resident, projected_reclaim_gib: step.expert.reclaim, projected_byte_hit_rate: step.expert.hit, estimated_slowdown_ratio: step.expert.slowdown, observations: step.observations, exact_route_required: true, executable: false, data_plane_ready: false, evidence: "policy_scenario_not_measurement" }, data_plane: { route_trace: { phase: step.phase, decode_observations: step.observations, projected_byte_hit_rate: { [step.expert.slots]: step.expert.hit } }, state_island: { attached: true, allocated_bytes: 441450496, copy_bytes: 0, resize_guard: { checked: true, preserved: true } } } }, decision: { score: step.state === "yielding" ? 0.42 : 0.71, reason: step.reason, costs: { yield: step.state === "yielding" ? 0.42 : 2.84, hibernate: 0.71, restore_penalty: 0.12 } } };
       this.pushSample(this.replayStatus); this.refreshIcons();
     },
     async compilePolicy() {
@@ -317,6 +333,7 @@ createApp({
       if (metrics.rdma_host_staging?.staging_bandwidth_gbps != null) return `${Number(metrics.rdma_host_staging.staging_bandwidth_gbps).toFixed(1)} Gb/s`;
       if (metrics.storage?.bandwidth_gbps != null) return `${Number(metrics.storage.bandwidth_gbps).toFixed(2)} Gb/s`;
       if (metrics.read_gbps != null) return `${Number(metrics.read_gbps).toFixed(2)} GB/s`;
+      if (metrics.projected_reclaim_gib != null) return `${Number(metrics.projected_reclaim_gib).toFixed(2)} GiB projected`;
       if (metrics.duplicate_tokens === 0) return "0 token loss";
       return "recorded";
     },
@@ -325,7 +342,7 @@ createApp({
       const date = new Date(Number(value) > 1e12 ? Number(value) : Number(value) * 1000);
       return Number.isNaN(date.valueOf()) ? String(value).slice(0, 16) : date.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
     },
-    eventName(type) { return ({ sleep: "休眠", hibernate: "深度休眠", wake: "恢复", benchmark: "基准", policy: "策略" })[type] || type || "事件"; },
+    eventName(type) { return ({ sleep: "休眠", hibernate: "深度休眠", wake: "恢复", benchmark: "基准", policy: "策略", expert_dataplane: "专家驻留" })[type] || type || "事件"; },
     eventTone(type) { return ["wake", "benchmark"].includes(type) ? "good" : type?.includes("error") ? "bad" : "warn"; },
     showToast(text, tone = "info") { this.toast = { text, tone }; window.clearTimeout(this.toastTimer); this.toastTimer = window.setTimeout(() => { this.toast = null; }, 3200); },
     refreshIcons() { this.$nextTick(() => window.lucide?.createIcons({ attrs: { "stroke-width": 1.8 } })); },

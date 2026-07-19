@@ -51,6 +51,10 @@ class LayerCounters:
     bytes_loaded: int = 0
     load_time_ns: int = 0
     resize_count: int = 0
+    resize_time_ns: int = 0
+    gpu_copy_bytes: int = 0
+    batch_loads: int = 0
+    batch_objects: int = 0
 
 
 @dataclass(slots=True)
@@ -139,6 +143,7 @@ class ExpertSlotDataPlane:
                 state.counters.hits += 1
 
             protected = set(requested)
+            reservations: list[tuple[int, SlotRecord]] = []
             for expert in missing:
                 state.counters.misses += 1
                 if reason == "prefetch":
@@ -150,35 +155,55 @@ class ExpertSlotDataPlane:
                 slot.error = ""
                 state.generation += 1
                 slot.generation = state.generation
+                reservations.append((expert, slot))
+
+            if reservations:
                 state.sink.publish_mapping(
                     dict(state.logical_to_slot), state.generation
                 )
-
                 started = time.perf_counter_ns()
                 try:
-                    payload = self.source.get(layer, expert)
-                    if payload.format != state.sink.required_format:
-                        raise ValueError(
-                            f"slot sink requires {state.sink.required_format}, "
-                            f"found {payload.format}"
+                    get_many = getattr(self.source, "get_many", None)
+                    if callable(get_many):
+                        payloads = get_many(
+                            [(layer, expert) for expert, _slot in reservations]
                         )
-                    state.sink.write(slot.slot, payload)
+                    else:
+                        payloads = [
+                            self.source.get(layer, expert)
+                            for expert, _slot in reservations
+                        ]
+                    if len(payloads) != len(reservations):
+                        raise RuntimeError("expert source returned a short batch")
+                    for (expert, slot), payload in zip(reservations, payloads):
+                        if (payload.layer, payload.expert) != (layer, expert):
+                            raise ValueError("batched expert source changed request order")
+                        if payload.format != state.sink.required_format:
+                            raise ValueError(
+                                f"slot sink requires {state.sink.required_format}, "
+                                f"found {payload.format}"
+                            )
+                        state.sink.write(slot.slot, payload)
                 except Exception as exc:
-                    slot.state = SlotState.FAILED
-                    slot.error = str(exc)
-                    slot.logical_expert = None
-                    state.sink.invalidate(slot.slot)
+                    for _expert, slot in reservations:
+                        slot.state = SlotState.FAILED
+                        slot.error = str(exc)
+                        slot.logical_expert = None
+                        state.sink.invalidate(slot.slot)
                     state.sink.publish_mapping(
                         dict(state.logical_to_slot), state.generation
                     )
                     raise
                 elapsed = time.perf_counter_ns() - started
-                slot.state = SlotState.READY
-                slot.last_used_at = time.monotonic()
-                slot.loads += 1
-                state.logical_to_slot[expert] = slot.slot
-                state.counters.bytes_loaded += len(payload.data)
+                for (expert, slot), payload in zip(reservations, payloads):
+                    slot.state = SlotState.READY
+                    slot.last_used_at = time.monotonic()
+                    slot.loads += 1
+                    state.logical_to_slot[expert] = slot.slot
+                    state.counters.bytes_loaded += len(payload.data)
                 state.counters.load_time_ns += elapsed
+                state.counters.batch_loads += 1
+                state.counters.batch_objects += len(reservations)
 
             state.generation += 1
             state.sink.publish_mapping(dict(state.logical_to_slot), state.generation)
@@ -242,19 +267,53 @@ class ExpertSlotDataPlane:
                         f"cannot resize layer {layer}: backing object {expert} missing"
                     )
 
+            retained_slots = [
+                (expert, state.logical_to_slot[expert])
+                for expert in retained
+                if expert in state.logical_to_slot
+            ]
+            started = time.perf_counter_ns()
             state.sink.publish_mapping({}, state.generation + 1)
+            fast_resize = getattr(state.sink, "resize_with_retained", None)
             state.logical_to_slot.clear()
-            state.sink.begin_resize(slot_count)
-            state.slots = [SlotRecord(slot=index) for index in range(slot_count)]
             state.generation += 1
             state.counters.resize_count += 1
             try:
-                if retained:
-                    self.ensure(layer, retained, reason="resize_restore")
-                state.sink.finish_resize()
+                if callable(fast_resize):
+                    outcome = fast_resize(slot_count, retained_slots)
+                    mapping = {
+                        int(logical): int(slot)
+                        for logical, slot in dict(outcome.get("mapping", {})).items()
+                    }
+                    state.slots = [
+                        SlotRecord(slot=index) for index in range(slot_count)
+                    ]
+                    now = time.monotonic()
+                    for logical, slot_index in mapping.items():
+                        slot = state.slots[slot_index]
+                        slot.state = SlotState.READY
+                        slot.logical_expert = logical
+                        slot.last_used_at = now
+                        slot.loads = 1
+                    state.logical_to_slot = mapping
+                    state.counters.gpu_copy_bytes += int(
+                        outcome.get("bytes_copied", 0)
+                    )
+                    state.sink.finish_resize()
+                    state.sink.publish_mapping(mapping, state.generation)
+                else:
+                    state.sink.begin_resize(slot_count)
+                    state.slots = [
+                        SlotRecord(slot=index) for index in range(slot_count)
+                    ]
+                    if retained:
+                        self.ensure(layer, retained, reason="resize_restore")
+                    state.sink.finish_resize()
             except Exception:
                 state.sink.publish_mapping({}, state.generation)
                 raise
+            finally:
+                state.counters.resize_time_ns += time.perf_counter_ns() - started
             return self.layer_status(layer)
 
     def layers(self) -> list[int]:
