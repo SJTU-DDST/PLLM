@@ -97,9 +97,16 @@ def flatten_cache_tensors(value: Any) -> list[Any]:
     return flattened
 
 
-def cache_storage_signature(value: Any) -> dict[str, Any]:
-    """Describe cache allocations without copying or synchronizing tensor data."""
+def cache_storage_signature(
+    value: Any, *, sample_content: bool = False, sample_bytes: int = 64
+) -> dict[str, Any]:
+    """Describe cache allocations and optionally fingerprint tiny content samples."""
+    import torch
+
+    if sample_bytes <= 0:
+        raise ValueError("sample_bytes must be positive")
     storages: dict[tuple[str, int], int] = {}
+    representatives: dict[tuple[str, int], Any] = {}
     tensors = flatten_cache_tensors(value)
     for tensor in tensors:
         if not hasattr(tensor, "untyped_storage"):
@@ -107,17 +114,38 @@ def cache_storage_signature(value: Any) -> dict[str, Any]:
         storage = tensor.untyped_storage()
         key = (str(tensor.device), int(storage.data_ptr()))
         storages[key] = max(storages.get(key, 0), int(storage.nbytes()))
+        representatives.setdefault(key, tensor)
     encoded = "|".join(
         f"{device}:{pointer}:{size}"
         for (device, pointer), size in sorted(storages.items())
     ).encode()
+    content = hashlib.sha256()
+    sampled = 0
+    if sample_content:
+        for key in sorted(representatives):
+            tensor = representatives[key].detach()
+            if not tensor.is_contiguous():
+                raise RuntimeError("state-island sampling requires contiguous cache tensors")
+            raw = tensor.view(torch.uint8).reshape(-1)
+            length = int(raw.numel())
+            if length <= 0:
+                continue
+            width = min(sample_bytes, length)
+            offsets = sorted({0, max(0, (length - width) // 2), length - width})
+            content.update(f"{key[0]}:{key[1]}:{length}".encode())
+            for offset in offsets:
+                payload = raw[offset : offset + width].cpu().numpy().tobytes()
+                content.update(payload)
+                sampled += len(payload)
     return {
         "attached": bool(tensors),
         "tensor_count": len(tensors),
         "storage_count": len(storages),
         "allocated_bytes": sum(storages.values()),
         "allocation_fingerprint": hashlib.sha256(encoded).hexdigest(),
-        "copy_bytes": 0,
+        "content_sample_fingerprint": content.hexdigest() if sample_content else None,
+        "sampled_content_bytes": sampled,
+        "copy_bytes": sampled,
         "scope": "attention_kv_and_mamba_conv_ssm_allocations",
     }
 
@@ -141,6 +169,7 @@ class EERRuntimeConfig:
     rdma_pool_port: int
     rdma_pool_binary: Path
     rdma_pool_index: Path | None
+    rdma_cuda_register_staging: bool
     route_window_steps: int
 
     @classmethod
@@ -197,6 +226,9 @@ class EERRuntimeConfig:
                 if os.getenv("PLLM_EER_RDMA_POOL_INDEX")
                 else None
             ),
+            rdma_cuda_register_staging=(
+                os.getenv("PLLM_EER_RDMA_CUDA_REGISTER_STAGING", "1") == "1"
+            ),
             route_window_steps=int(os.getenv("PLLM_EER_ROUTE_WINDOW_STEPS", "256")),
         )
 
@@ -248,7 +280,7 @@ class TorchMarlinSlotSink:
             if _dtype_name(expected_dtype) != item.dtype or expected_shape != item.shape:
                 raise ValueError(f"runtime tensor layout mismatch for {item.name}")
             raw = payload.tensor_bytes(item.name)
-            cpu_bytes = self.torch.frombuffer(bytearray(raw), dtype=self.torch.uint8)
+            cpu_bytes = self.torch.frombuffer(raw, dtype=self.torch.uint8)
             cpu_tensor = cpu_bytes.view(expected_dtype).reshape(expected_shape)
             target = getattr(self.layer, item.name).data[slot]
             target.copy_(cpu_tensor.to(device=target.device), non_blocking=False)
@@ -386,6 +418,17 @@ class EERRuntime:
             catalog.experts_per_layer,
             config.route_window_steps,
         )
+        self._last_moe_layer = max(catalog.moe_layers)
+        self._miss_debt_budget_ms = float(
+            os.getenv("PLLM_EER_MISS_DEBT_BUDGET_MS", "400")
+        )
+        self._miss_debt_ms = 0.0
+        self._miss_debt_load_ms = 0.0
+        self._miss_debt_tokens = 0
+        self._miss_debt_violations = 0
+        self._miss_debt_exceeded = False
+        self._current_token_load_ms = 0.0
+        self._miss_debt_lock = threading.Lock()
         self.local_store = SSDExpertStore(
             config.cache_dir,
             model_fingerprint=self.fingerprint,
@@ -409,6 +452,8 @@ class EERRuntime:
                     device=config.rdma_device,
                     ib_port=config.rdma_ib_port,
                     gid_index=config.rdma_gid_index,
+                    shared_staging=True,
+                    cuda_register_staging=config.rdma_cuda_register_staging,
                 )
                 self.remote_pool = RDMAPoolExpertStore(stream, self.local_store)
                 remote_sources.append(self.remote_pool)
@@ -467,7 +512,7 @@ class EERRuntime:
     def bind_model_runner(self, model_runner: Any) -> None:
         self._model_runner = model_runner
 
-    def state_island_status(self) -> dict[str, Any]:
+    def state_island_status(self, *, sample_content: bool = False) -> dict[str, Any]:
         if self._model_runner is None:
             return {
                 "attached": False,
@@ -477,7 +522,8 @@ class EERRuntime:
                 "resize_guard": dict(self._last_state_island_guard),
             }
         result = cache_storage_signature(
-            getattr(self._model_runner, "kv_caches", None)
+            getattr(self._model_runner, "kv_caches", None),
+            sample_content=sample_content,
         )
         result["resize_guard"] = dict(self._last_state_island_guard)
         return result
@@ -552,17 +598,52 @@ class EERRuntime:
         if self.suspended:
             raise RuntimeError("PLLM EER data plane is suspended")
         layer_id = _layer_id(layer)
-        experts = [
-            int(item)
-            for item in topk_ids.detach().unique().cpu().tolist()
-            if int(item) >= 0
-        ]
-        self.route_window.observe(
-            layer_id,
-            experts,
-            token_count=max(1, int(topk_ids.shape[0])),
+        phase = self.route_window.current_phase()
+        fully_resident = self.data_plane.is_fully_resident(layer_id)
+        if fully_resident and phase != "decode":
+            return
+        if not fully_resident and phase != "decode":
+            raise RuntimeError(
+                "a non-full expert profile may execute only in decode; "
+                "new prefill must be admitted through the PLLM proxy"
+            )
+        detached = topk_ids.detach()
+        if detached.ndim == 1:
+            detached = detached.reshape(1, -1)
+        else:
+            detached = detached.reshape(-1, detached.shape[-1])
+        rows = detached.cpu().tolist()
+        self.route_window.observe_rows(layer_id, rows)
+        experts = list(
+            dict.fromkeys(
+                int(item) for row in rows for item in row if int(item) >= 0
+            )
         )
+        if fully_resident:
+            return
+        load_started = time.perf_counter()
         self.data_plane.ensure(layer_id, experts, reason="actual_topk")
+        load_ms = (time.perf_counter() - load_started) * 1000.0
+        self._record_miss_load(layer_id, len(rows), load_ms)
+
+    def _record_miss_load(
+        self, layer_id: int, token_rows: int, load_ms: float
+    ) -> None:
+        with self._miss_debt_lock:
+            self._current_token_load_ms += load_ms
+            if layer_id == self._last_moe_layer:
+                tokens = max(1, int(token_rows))
+                self._miss_debt_load_ms += self._current_token_load_ms
+                self._miss_debt_tokens += tokens
+                allowance = self._miss_debt_budget_ms * tokens
+                self._miss_debt_ms = max(
+                    0.0,
+                    self._miss_debt_ms + self._current_token_load_ms - allowance,
+                )
+                if self._miss_debt_ms > self._miss_debt_budget_ms:
+                    self._miss_debt_exceeded = True
+                    self._miss_debt_violations += 1
+                self._current_token_load_ms = 0.0
 
     def handle_command(self, request: dict[str, Any]) -> dict[str, Any]:
         command = str(request.get("command", "status"))
@@ -607,30 +688,67 @@ class EERRuntime:
         if command == "resize":
             if request.get("quiesced") is not True:
                 raise RuntimeError("resize requires a token-boundary quiesced=true guard")
-            slots = int(request["slots_per_layer"])
+            requested_by_layer = {
+                int(layer): int(slots)
+                for layer, slots in dict(request.get("slots_by_layer") or {}).items()
+            }
+            uniform_slots = request.get("slots_per_layer")
+            if uniform_slots is None and not requested_by_layer:
+                raise ValueError("resize requires slots_per_layer or slots_by_layer")
             retain_policy = str(request.get("retain_policy", "lru"))
-            state_before = self.state_island_status()
+            if request.get("miss_debt_budget_ms") is not None:
+                budget = float(request["miss_debt_budget_ms"])
+                if budget <= 0:
+                    raise ValueError("miss debt budget must be positive")
+                self._miss_debt_budget_ms = budget
+            self._reset_miss_debt()
+            state_before = self.state_island_status(sample_content=True)
             results = []
             for layer in self.data_plane.layers():
+                before = self.data_plane.layer_status(layer, include_mapping=False)
+                current_slots = int(before["slot_count"])
+                global_experts = int(before["global_experts"])
+                slots = int(
+                    requested_by_layer.get(
+                        layer,
+                        uniform_slots if uniform_slots is not None else current_slots,
+                    )
+                )
+                if slots < 22 or slots > global_experts:
+                    raise ValueError(
+                        f"layer {layer} slot target must be within [22, {global_experts}]"
+                    )
+                if slots == current_slots:
+                    results.append(before)
+                    continue
                 retain = (
                     self.route_window.hot_experts(layer, slots)
                     if retain_policy == "decode_hot"
                     else None
                 )
-                result = self.data_plane.resize(layer, slots, retain=retain)
-                global_experts = int(result.get("global_experts", 0))
-                if slots >= global_experts > 0:
-                    self.data_plane.prefetch(
-                        layer, list(range(global_experts))
+                preserve_retained = slots < current_slots
+                if slots > current_slots:
+                    retain = (
+                        list(range(global_experts))
+                        if slots >= global_experts
+                        else self.route_window.hot_experts(layer, slots)
                     )
+                result = self.data_plane.resize(
+                    layer,
+                    slots,
+                    retain=retain,
+                    preserve_retained=preserve_retained,
+                )
                 results.append(result)
-            state_after = self.state_island_status()
+            state_after = self.state_island_status(sample_content=True)
             checked = bool(state_before.get("attached"))
             preserved = (
                 state_before.get("allocation_fingerprint")
                 == state_after.get("allocation_fingerprint")
                 and state_before.get("allocated_bytes")
                 == state_after.get("allocated_bytes")
+                and state_before.get("content_sample_fingerprint")
+                == state_after.get("content_sample_fingerprint")
                 if checked
                 else None
             )
@@ -639,7 +757,9 @@ class EERRuntime:
                 "preserved": preserved,
                 "before_bytes": int(state_before.get("allocated_bytes", 0)),
                 "after_bytes": int(state_after.get("allocated_bytes", 0)),
-                "copy_bytes": 0,
+                "copy_bytes": int(state_before.get("copy_bytes", 0))
+                + int(state_after.get("copy_bytes", 0)),
+                "content_sampled": checked,
             }
             if checked and not preserved:
                 raise RuntimeError(
@@ -647,7 +767,12 @@ class EERRuntime:
                 )
             return {
                 "resized_layers": len(results),
-                "slots_per_layer": slots,
+                "slots_per_layer": (
+                    int(uniform_slots) if uniform_slots is not None else None
+                ),
+                "slots_by_layer": {
+                    str(item["layer"]): int(item["slot_count"]) for item in results
+                },
                 "retain_policy": retain_policy,
                 "state_island_guard": dict(self._last_state_island_guard),
             }
@@ -656,6 +781,8 @@ class EERRuntime:
             self.route_window.set_phase(
                 phase, reset_decode=bool(request.get("reset_decode", False))
             )
+            if bool(request.get("reset_decode", False)):
+                self._reset_miss_debt()
             return self.route_window.status()
         if command == "suspend":
             if request.get("quiesced") is not True:
@@ -685,6 +812,10 @@ class EERRuntime:
         live_slots = {
             int(item["slot_count"]) for item in data_plane.get("layers", [])
         }
+        slots_by_layer = {
+            str(item["layer"]): int(item["slot_count"])
+            for item in data_plane.get("layers", [])
+        }
         return {
             "mode": self.config.mode,
             "backend": "vllm_modelopt_nvfp4_marlin",
@@ -699,7 +830,14 @@ class EERRuntime:
             "slots_per_layer": (
                 next(iter(live_slots))
                 if len(live_slots) == 1
-                else self.config.slots_per_layer
+                else min(live_slots, default=self.config.slots_per_layer)
+            ),
+            "slots_by_layer": slots_by_layer,
+            "minimum_slots_per_layer": min(
+                live_slots, default=self.config.slots_per_layer
+            ),
+            "maximum_slots_per_layer": max(
+                live_slots, default=self.config.slots_per_layer
             ),
             "cache": self.local_store.status(),
             "rdma": {
@@ -730,8 +868,31 @@ class EERRuntime:
             "last_error": self.last_error,
             "data_plane": data_plane,
             "route_trace": self.route_window.status(),
+            "miss_debt": self._miss_debt_status(),
             "state_island": self.state_island_status(),
         }
+
+    def _reset_miss_debt(self) -> None:
+        with self._miss_debt_lock:
+            self._miss_debt_ms = 0.0
+            self._miss_debt_load_ms = 0.0
+            self._miss_debt_tokens = 0
+            self._miss_debt_violations = 0
+            self._miss_debt_exceeded = False
+            self._current_token_load_ms = 0.0
+
+    def _miss_debt_status(self) -> dict[str, Any]:
+        with self._miss_debt_lock:
+            return {
+                "budget_ms_per_token": self._miss_debt_budget_ms,
+                "debt_ms": self._miss_debt_ms,
+                "blocking_load_ms": self._miss_debt_load_ms,
+                "decode_tokens": self._miss_debt_tokens,
+                "violations": self._miss_debt_violations,
+                "exceeded": self._miss_debt_exceeded,
+                "action": "yield_or_hibernate",
+                "evidence": "runtime_remote_parse_h2d_mapping_wall",
+            }
 
     def _write_export_manifest(self) -> None:
         self.local_store.enforce_quota()

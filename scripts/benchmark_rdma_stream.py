@@ -64,8 +64,12 @@ def main() -> int:
     parser.add_argument("--device", default="")
     parser.add_argument("--gid-index", type=int, default=0)
     parser.add_argument("--allocator", choices=("aligned", "cuda-host"), default="aligned")
+    parser.add_argument("--shared-staging", action="store_true")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=22)
+    parser.add_argument(
+        "--selection", choices=("strided", "sequential"), default="strided"
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("results/rdma_stream_get_probe.json")
     )
@@ -75,13 +79,25 @@ def main() -> int:
 
     rows = read_index(args.index)
     keys = [key for key, _size in rows]
-    requested_batches = [
-        [
-            keys[(iteration * args.batch_size + offset) % len(keys)]
-            for offset in range(args.batch_size)
+    if args.selection == "strided":
+        # Both strides are co-prime to the 20,480-object production image, so
+        # adjacent batch entries span layers and successive batches rotate the
+        # complete image deterministically.
+        requested_batches = [
+            [
+                keys[(iteration * 997 + offset * 929) % len(keys)]
+                for offset in range(args.batch_size)
+            ]
+            for iteration in range(args.iterations)
         ]
-        for iteration in range(args.iterations)
-    ]
+    else:
+        requested_batches = [
+            [
+                keys[(iteration * args.batch_size + offset) % len(keys)]
+                for offset in range(args.batch_size)
+            ]
+            for iteration in range(args.iterations)
+        ]
     expected = read_profile(
         rows,
         args.root,
@@ -98,8 +114,10 @@ def main() -> int:
         gid_index=args.gid_index,
         timeout_seconds=60,
         batch_size=args.batch_size,
+        shared_staging=args.shared_staging,
     )
     latencies_ms: list[float] = []
+    batch_bytes: list[int] = []
     transferred = 0
     started = time.perf_counter()
     try:
@@ -107,17 +125,22 @@ def main() -> int:
             get_started = time.perf_counter()
             actual = stream.get_many(requested)
             latencies_ms.append((time.perf_counter() - get_started) * 1000)
+            current_bytes = 0
             for key, content in zip(requested, actual):
                 if content != expected[key]:
                     raise ValueError(
                         f"remote bytes differ from the source profile: {key}"
                     )
                 transferred += len(content)
+                current_bytes += len(content)
+            batch_bytes.append(current_bytes)
         status = stream.status()
     finally:
         stream.close()
     elapsed = time.perf_counter() - started
     steady = latencies_ms[1:] or latencies_ms
+    steady_bytes = sum(batch_bytes[1:] or batch_bytes)
+    steady_seconds = sum(steady) / 1000.0
     result = {
         "schema_version": 1,
         "created_at": datetime.now().astimezone().isoformat(),
@@ -128,10 +151,15 @@ def main() -> int:
         "validated_source_objects": len(expected),
         "batches": args.iterations,
         "batch_size": args.batch_size,
+        "selection": args.selection,
+        "shared_staging": args.shared_staging,
         "objects": args.iterations * args.batch_size,
         "bytes": transferred,
         "wall_seconds": elapsed,
         "wall_effective_gbps": transferred * 8 / elapsed / 1e9,
+        "steady_effective_gbps": (
+            steady_bytes * 8 / steady_seconds / 1e9 if steady_seconds else 0.0
+        ),
         "first_get_ms": latencies_ms[0],
         "steady_mean_ms": statistics.fmean(steady),
         "steady_p50_ms": percentile(steady, 0.50),

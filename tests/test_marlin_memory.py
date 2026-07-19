@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import threading
+
 import torch
 
 from pllm.vllm_eer_runtime import (
+    EERRuntime,
     cache_storage_signature,
     flatten_cache_tensors,
     low_memory_nvfp4_scale_factor,
@@ -100,3 +103,36 @@ def test_cache_storage_signature_deduplicates_views_without_copying() -> None:
     assert before["storage_count"] == 2
     assert before["allocated_bytes"] == 24 * attention.element_size()
     assert before["copy_bytes"] == 0
+
+
+def test_cache_storage_signature_detects_sampled_state_mutation() -> None:
+    attention = torch.arange(256, dtype=torch.float32)
+    before = cache_storage_signature([attention], sample_content=True)
+    attention[128] = -1
+    after = cache_storage_signature([attention], sample_content=True)
+
+    assert before["allocation_fingerprint"] == after["allocation_fingerprint"]
+    assert before["content_sample_fingerprint"] != after["content_sample_fingerprint"]
+    assert before["sampled_content_bytes"] > 0
+
+
+def test_runtime_miss_debt_triggers_on_actual_blocking_load() -> None:
+    runtime = object.__new__(EERRuntime)
+    runtime._last_moe_layer = 3
+    runtime._miss_debt_budget_ms = 10.0
+    runtime._miss_debt_ms = 0.0
+    runtime._miss_debt_load_ms = 0.0
+    runtime._miss_debt_tokens = 0
+    runtime._miss_debt_violations = 0
+    runtime._miss_debt_exceeded = False
+    runtime._current_token_load_ms = 0.0
+    runtime._miss_debt_lock = threading.Lock()
+
+    runtime._record_miss_load(1, 1, 8.0)
+    runtime._record_miss_load(3, 1, 23.0)
+
+    status = runtime._miss_debt_status()
+    assert status["blocking_load_ms"] == 31.0
+    assert status["debt_ms"] == 21.0
+    assert status["exceeded"] is True
+    assert status["violations"] == 1

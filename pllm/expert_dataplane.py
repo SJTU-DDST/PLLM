@@ -162,28 +162,45 @@ class ExpertSlotDataPlane:
                     dict(state.logical_to_slot), state.generation
                 )
                 started = time.perf_counter_ns()
+                loaded_bytes = 0
+                loaded_objects = 0
+                load_batches = 0
                 try:
-                    get_many = getattr(self.source, "get_many", None)
-                    if callable(get_many):
-                        payloads = get_many(
-                            [(layer, expert) for expert, _slot in reservations]
-                        )
+                    requests = [
+                        (layer, expert) for expert, _slot in reservations
+                    ]
+                    iter_many = getattr(self.source, "iter_many", None)
+                    if callable(iter_many):
+                        payload_batches = iter_many(requests)
                     else:
-                        payloads = [
-                            self.source.get(layer, expert)
-                            for expert, _slot in reservations
+                        get_many = getattr(self.source, "get_many", None)
+                        payload_batches = [
+                            get_many(requests)
+                            if callable(get_many)
+                            else [self.source.get(*request) for request in requests]
                         ]
-                    if len(payloads) != len(reservations):
+                    for payloads in payload_batches:
+                        selected = reservations[
+                            loaded_objects : loaded_objects + len(payloads)
+                        ]
+                        if len(selected) != len(payloads):
+                            raise RuntimeError("expert source returned an oversized batch")
+                        for (expert, slot), payload in zip(selected, payloads):
+                            if (payload.layer, payload.expert) != (layer, expert):
+                                raise ValueError(
+                                    "batched expert source changed request order"
+                                )
+                            if payload.format != state.sink.required_format:
+                                raise ValueError(
+                                    f"slot sink requires {state.sink.required_format}, "
+                                    f"found {payload.format}"
+                                )
+                            state.sink.write(slot.slot, payload)
+                            loaded_bytes += len(payload.data)
+                        loaded_objects += len(payloads)
+                        load_batches += 1
+                    if loaded_objects != len(reservations):
                         raise RuntimeError("expert source returned a short batch")
-                    for (expert, slot), payload in zip(reservations, payloads):
-                        if (payload.layer, payload.expert) != (layer, expert):
-                            raise ValueError("batched expert source changed request order")
-                        if payload.format != state.sink.required_format:
-                            raise ValueError(
-                                f"slot sink requires {state.sink.required_format}, "
-                                f"found {payload.format}"
-                            )
-                        state.sink.write(slot.slot, payload)
                 except Exception as exc:
                     for _expert, slot in reservations:
                         slot.state = SlotState.FAILED
@@ -195,18 +212,21 @@ class ExpertSlotDataPlane:
                     )
                     raise
                 elapsed = time.perf_counter_ns() - started
-                for (expert, slot), payload in zip(reservations, payloads):
+                for expert, slot in reservations:
                     slot.state = SlotState.READY
                     slot.last_used_at = time.monotonic()
                     slot.loads += 1
                     state.logical_to_slot[expert] = slot.slot
-                    state.counters.bytes_loaded += len(payload.data)
+                state.counters.bytes_loaded += loaded_bytes
                 state.counters.load_time_ns += elapsed
-                state.counters.batch_loads += 1
+                state.counters.batch_loads += load_batches
                 state.counters.batch_objects += len(reservations)
 
-            state.generation += 1
-            state.sink.publish_mapping(dict(state.logical_to_slot), state.generation)
+            if reservations:
+                state.generation += 1
+                state.sink.publish_mapping(
+                    dict(state.logical_to_slot), state.generation
+                )
             return {expert: state.logical_to_slot[expert] for expert in requested}
 
     def prefetch(self, layer: int, experts: list[int]) -> dict[int, int]:
@@ -242,7 +262,11 @@ class ExpertSlotDataPlane:
         return count
 
     def resize(
-        self, layer: int, slot_count: int, retain: list[int] | None = None
+        self,
+        layer: int,
+        slot_count: int,
+        retain: list[int] | None = None,
+        preserve_retained: bool = True,
     ) -> dict[str, Any]:
         state = self._layer(layer)
         if slot_count <= 0 or slot_count > state.global_experts:
@@ -279,7 +303,7 @@ class ExpertSlotDataPlane:
             state.generation += 1
             state.counters.resize_count += 1
             try:
-                if callable(fast_resize):
+                if callable(fast_resize) and preserve_retained:
                     outcome = fast_resize(slot_count, retained_slots)
                     mapping = {
                         int(logical): int(slot)
@@ -315,6 +339,15 @@ class ExpertSlotDataPlane:
             finally:
                 state.counters.resize_time_ns += time.perf_counter_ns() - started
             return self.layer_status(layer)
+
+    def is_fully_resident(self, layer: int) -> bool:
+        state = self._layer(layer)
+        with state.lock:
+            return bool(
+                len(state.slots) == state.global_experts
+                and len(state.logical_to_slot) == state.global_experts
+                and all(slot.state == SlotState.READY for slot in state.slots)
+            )
 
     def layers(self) -> list[int]:
         with self._lock:

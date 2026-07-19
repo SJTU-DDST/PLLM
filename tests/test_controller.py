@@ -153,12 +153,14 @@ def test_auto_resize_requires_a_guardrail_approved_decode_plan(
         manager=FakeManager(),
     )
     calls = []
+    controller.expert_runtime = FakeExpertRuntime()
     controller.expert_dataplane_action = calls.append
     status = {
         "data_plane_ready": True,
-        "plan": {"action": "elastic_resident"},
+        "plan": {"action": "elastic_resident", "generation": 3},
         "decode_plan": {"action": "observe", "slots_per_layer": 512},
         "data_plane": {
+            "route_trace": {"request_generation": 1, "route_generation": 9},
             "data_plane": {"layers": [{"slot_count": 512}]}
         },
     }
@@ -169,14 +171,20 @@ def test_auto_resize_requires_a_guardrail_approved_decode_plan(
     status["decode_plan"] = {
         "action": "decode_elastic",
         "slots_per_layer": 496,
+        "slots_by_layer": {"0": 496},
         "estimated_slowdown_ratio": 1.4,
+        "request_generation": 1,
+        "route_generation": 9,
+        "capacity_generation": 3,
+        "horizon": {"planner_lower_bound_tokens": 0},
     }
     assert controller._maybe_auto_resize(status) is True
     assert calls == [
         {
             "action": "resize",
-            "slots_per_layer": 496,
+            "slots_by_layer": {0: 496},
             "retain_policy": "decode_hot",
+            "miss_debt_budget_ms": 400.0,
         }
     ]
 
@@ -224,3 +232,105 @@ def test_new_prefill_expands_an_elastic_runtime_before_forwarding(
             "phase": "prefill",
         }
     ]
+
+
+def test_phase_eer_rejects_overlapping_proxy_requests(tmp_path: Path) -> None:
+    controller = PLLMController(
+        PLLMConfig(
+            model_path=str(tmp_path / "missing-model"),
+            hibercache_dir=str(tmp_path / "cache"),
+            expert_runtime_socket=str(tmp_path / "pllm-eer.sock"),
+        ),
+        Storage(tmp_path / "events.sqlite3"),
+        monitor=FakeMonitor(),
+        manager=FakeManager(),
+    )
+    controller.expert_runtime = FakeExpertRuntime()
+    controller.prepare_inference_request("request-a", minimum_decode_tokens=128)
+
+    try:
+        controller.prepare_inference_request("request-b", minimum_decode_tokens=128)
+    except RuntimeError as exc:
+        assert "serializes inference" in str(exc)
+    else:
+        raise AssertionError("overlapping PhaseEER request was admitted")
+
+
+def test_decode_horizon_uses_a_minimum_and_exact_token_progress(tmp_path: Path) -> None:
+    controller = PLLMController(
+        PLLMConfig(
+            model_path=str(tmp_path / "missing-model"),
+            hibercache_dir=str(tmp_path / "cache"),
+            expert_runtime_socket=str(tmp_path / "pllm-eer.sock"),
+        ),
+        Storage(tmp_path / "events.sqlite3"),
+        monitor=FakeMonitor(),
+        manager=FakeManager(),
+    )
+    controller.expert_runtime = FakeExpertRuntime()
+
+    controller.prepare_inference_request("request-a", minimum_decode_tokens=300)
+    controller.mark_inference_phase("decode", request_id="request-a")
+    controller.record_decode_progress("request-a", 17, exact=True)
+
+    assert controller._inference_min_remaining_tokens["request-a"] == 283
+
+    controller.record_decode_progress("request-a", 1, exact=False)
+    assert controller._inference_min_remaining_tokens["request-a"] == 0
+
+
+def test_capacity_release_falls_back_to_hibernate_when_decode_is_infeasible(
+    tmp_path: Path,
+) -> None:
+    controller = PLLMController(
+        PLLMConfig(
+            model_path=str(tmp_path / "missing-model"),
+            hibercache_dir=str(tmp_path / "cache"),
+            expert_data_plane_enabled=True,
+            expert_auto_resize_enabled=True,
+        ),
+        Storage(tmp_path / "events.sqlite3"),
+        monitor=FakeMonitor(),
+        manager=FakeManager(),
+    )
+
+    fallback = controller._expert_fallback_action(
+        {
+            "data_plane_ready": True,
+            "plan": {"action": "elastic_resident"},
+            "decode_plan": {"action": "yield", "reason": "risk gate failed"},
+        }
+    )
+
+    assert fallback == (
+        "hibernate",
+        2,
+        "required capacity cannot be released within the decode risk and horizon SLO",
+    )
+
+
+def test_pending_planner_does_not_yield_without_capacity_pressure(
+    tmp_path: Path,
+) -> None:
+    controller = PLLMController(
+        PLLMConfig(
+            model_path=str(tmp_path / "missing-model"),
+            hibercache_dir=str(tmp_path / "cache"),
+            expert_data_plane_enabled=True,
+            expert_auto_resize_enabled=True,
+        ),
+        Storage(tmp_path / "events.sqlite3"),
+        monitor=FakeMonitor(),
+        manager=FakeManager(),
+    )
+
+    assert (
+        controller._expert_fallback_action(
+            {
+                "data_plane_ready": True,
+                "plan": {"action": "full_resident"},
+                "decode_plan": {"action": "yield", "planner_pending": True},
+            }
+        )
+        is None
+    )

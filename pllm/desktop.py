@@ -399,12 +399,26 @@ class OverlayWindow(QWidget):
         route_trace = data_plane.get("route_trace") or {}
         state_island = data_plane.get("state_island") or {}
         phase = str(route_trace.get("phase") or "idle")
-        slots = data_plane.get("slots_per_layer", decode_plan.get("slots_per_layer"))
-        observations = route_trace.get(
-            "decode_observations", decode_plan.get("observations", 0)
+        slots_by_layer = data_plane.get("slots_by_layer") or decode_plan.get(
+            "slots_by_layer"
+        ) or {}
+        slot_values = [int(value) for value in slots_by_layer.values()]
+        if slot_values:
+            slots = (
+                str(min(slot_values))
+                if min(slot_values) == max(slot_values)
+                else f"{min(slot_values)}-{max(slot_values)}"
+            )
+        else:
+            slots = data_plane.get(
+                "slots_per_layer", decode_plan.get("slots_per_layer")
+            )
+        windows = (route_trace.get("next_window") or {}).get(
+            "minimum_completed_windows", 0
         )
+        horizon = (decode_plan.get("horizon") or {}).get("remaining_tokens", 0)
         self.expert_label.setText(
-            f"Decode  {phase} · slots {slots or '--'}/512 · route {observations or 0}"
+            f"Decode  {phase} · slots {slots or '--'}/512 · W {windows} · H {horizon}"
         )
         island_bytes = int(state_island.get("allocated_bytes") or 0)
         guard = state_island.get("resize_guard") or {}
@@ -459,7 +473,7 @@ class OverlayWindow(QWidget):
             {
                 "state": "elastic_resident",
                 "mode": "auto",
-                "reason": "DEMO SCENARIO: decode 496-slot guardrail passed",
+                "reason": "DEMO SCENARIO: 11 high-locality layers use 384 slots",
                 "last_action_duration_ms": None,
                 "reclaimed_gb": 1.8,
                 "services": [{"controllable": True}],
@@ -471,16 +485,27 @@ class OverlayWindow(QWidget):
                     "foreground": {"app_id": "Blender"},
                 },
                 "expert_residency": {
-                    "decode_plan": {"slots_per_layer": 496, "observations": 880},
+                    "decode_plan": {
+                        "slots_per_layer": 384,
+                        "slots_by_layer": {
+                            str(layer): (384 if layer < 11 else 512)
+                            for layer in range(40)
+                        },
+                        "horizon": {"remaining_tokens": 256},
+                    },
                     "data_plane": {
-                        "slots_per_layer": 496,
+                        "slots_per_layer": 384,
                         "route_trace": {
                             "phase": "decode",
                             "decode_observations": 880,
+                            "next_window": {"minimum_completed_windows": 2},
                         },
                         "state_island": {
                             "allocated_bytes": 441450496,
-                            "resize_guard": {"preserved": True},
+                            "resize_guard": {
+                                "preserved": True,
+                                "content_sampled": True,
+                            },
                         },
                     },
                 },
@@ -488,7 +513,10 @@ class OverlayWindow(QWidget):
         )
         self.update_events(
             [
-                {"event_type": "expert_dataplane", "reason": "scenario: 496-slot decode"},
+                {
+                    "event_type": "expert_dataplane",
+                    "reason": "scenario: per-layer 384/512 decode",
+                },
                 {"event_type": "policy", "reason": "strict latency guardrail"},
             ]
         )

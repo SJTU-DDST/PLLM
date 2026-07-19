@@ -66,6 +66,7 @@ class PLLMController:
         self._last_service_refresh = 0.0
         self._last_expert_resize_at = 0.0
         self._inference_phases: dict[str, str] = {}
+        self._inference_min_remaining_tokens: dict[str, int] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -143,14 +144,30 @@ class PLLMController:
                 if not self.config.dry_run:
                     self.manager.sleep_all(0, mode="keep")
                 if action == "resize":
-                    slots = int(payload.get("slots_per_layer", 0))
-                    if slots < 22:
-                        raise ValueError("slots_per_layer cannot be below Top-22")
+                    slots_by_layer = {
+                        int(layer): int(slots)
+                        for layer, slots in dict(
+                            payload.get("slots_by_layer") or {}
+                        ).items()
+                    }
+                    uniform = payload.get("slots_per_layer")
+                    slots = int(uniform) if uniform is not None else None
+                    targets = list(slots_by_layer.values()) + (
+                        [slots] if slots is not None else []
+                    )
+                    if not targets or min(targets) < 22:
+                        raise ValueError("every layer slot target must be at least Top-22")
                     if payload.get("phase"):
                         self.expert_runtime.set_phase(str(payload["phase"]))
                     result = self.expert_runtime.resize(
                         slots,
                         retain_policy=str(payload.get("retain_policy", "lru")),
+                        slots_by_layer=slots_by_layer,
+                        miss_debt_budget_ms=(
+                            float(payload["miss_debt_budget_ms"])
+                            if payload.get("miss_debt_budget_ms") is not None
+                            else None
+                        ),
                     )
                 elif action == "prefetch":
                     result = self.expert_runtime.prefetch(
@@ -178,9 +195,8 @@ class PLLMController:
                     .get("model", {})
                     .get("experts_per_layer", 0)
                 )
-                runtime_slots = int(
-                    self.expert_runtime.status().get("slots_per_layer", 0)
-                )
+                runtime_status = self.expert_runtime.status()
+                runtime_slots = int(runtime_status.get("minimum_slots_per_layer", 0))
                 target_state = (
                     ControllerState.ACTIVE
                     if runtime_slots >= full_slots > 0
@@ -189,7 +205,11 @@ class PLLMController:
                 self._set_state(
                     target_state,
                     (
-                        f"expert data-plane resized to {slots} slots/layer"
+                        (
+                            f"expert data-plane resized {len(slots_by_layer)} layer profiles"
+                            if slots_by_layer
+                            else f"expert data-plane resized to {slots} slots/layer"
+                        )
                         if action == "resize"
                         else f"expert data-plane {action} completed"
                     ),
@@ -327,6 +347,7 @@ class PLLMController:
                 was_idle = not self._inference_phases
                 if normalized == "idle":
                     self._inference_phases.pop(request_id, None)
+                    self._inference_min_remaining_tokens.pop(request_id, None)
                 else:
                     self._inference_phases[request_id] = normalized
                 phases = set(self._inference_phases.values())
@@ -348,25 +369,60 @@ class PLLMController:
         except (OSError, RuntimeError, ValueError) as exc:
             LOGGER.debug("Could not update EER inference phase: %s", exc)
 
-    def prepare_inference_request(self, request_id: str) -> None:
+    def prepare_inference_request(
+        self,
+        request_id: str,
+        minimum_decode_tokens: int | None = None,
+        sequence_count: int = 1,
+    ) -> None:
         """Restore full expert residency before forwarding a new prefill."""
-        self.mark_inference_phase(
-            "prefill", reset_decode=True, request_id=request_id
-        )
+        if sequence_count != 1:
+            raise RuntimeError("PhaseEER requires exactly one sequence per request")
         runtime = self.expert_runtime.status()
         if not (
             self.config.expert_data_plane_enabled
             and runtime.get("online")
             and runtime.get("data_plane_ready")
         ):
+            if minimum_decode_tokens is not None and minimum_decode_tokens > 0:
+                with self._status_lock:
+                    self._inference_min_remaining_tokens[request_id] = int(
+                        minimum_decode_tokens
+                    )
+            self.mark_inference_phase(
+                "prefill", reset_decode=True, request_id=request_id
+            )
             return
         layers = runtime.get("data_plane", {}).get("layers", [])
         full_slots = max(
             (int(layer.get("global_experts", 0)) for layer in layers),
             default=0,
         )
-        current_slots = int(runtime.get("slots_per_layer", 0))
-        if full_slots > 0 and current_slots < full_slots:
+        non_full = any(
+            int(layer.get("slot_count", 0))
+            < int(layer.get("global_experts", 0))
+            for layer in layers
+        )
+        with self._status_lock:
+            active = dict(self._inference_phases)
+        if active:
+            raise RuntimeError(
+                "PhaseEER serializes inference to preserve request-local route history"
+            )
+        if non_full:
+            with self._status_lock:
+                workload = self._status.workload
+            if workload != WorkloadClass.IDLE:
+                raise RuntimeError(
+                    "prefill deferred while a decode profile or foreground reserve is active"
+                )
+        if minimum_decode_tokens is not None and minimum_decode_tokens > 0:
+            with self._status_lock:
+                self._inference_min_remaining_tokens[request_id] = int(
+                    minimum_decode_tokens
+                )
+        self.mark_inference_phase("prefill", reset_decode=True, request_id=request_id)
+        if full_slots > 0 and non_full:
             self.expert_dataplane_action(
                 {
                     "action": "resize",
@@ -375,6 +431,18 @@ class PLLMController:
                     "phase": "prefill",
                 }
             )
+
+    def record_decode_progress(
+        self, request_id: str, token_delta: int = 1, *, exact: bool = True
+    ) -> None:
+        if token_delta <= 0:
+            return
+        with self._status_lock:
+            remaining = self._inference_min_remaining_tokens.get(request_id)
+            if remaining is not None:
+                self._inference_min_remaining_tokens[request_id] = (
+                    max(0, remaining - int(token_delta)) if exact else 0
+                )
 
     def refresh_services(self) -> list[dict[str, Any]]:
         services = self.manager.refresh()
@@ -419,6 +487,12 @@ class PLLMController:
                             "costs": decision.costs,
                         }
                 if self._maybe_auto_resize(expert_status):
+                    continue
+                expert_fallback = self._expert_fallback_action(expert_status)
+                if expert_fallback is not None:
+                    _action, level, reason = expert_fallback
+                    if not (level == 0 and state == ControllerState.YIELDING):
+                        self._sleep(level, reason, mode="keep")
                     continue
                 if decision.action in {"yield", "hibernate", "sleep"}:
                     self._sleep(
@@ -594,9 +668,41 @@ class PLLMController:
         with self._status_lock:
             projection["active_inference_requests"] = len(self._inference_phases)
             projection["request_phases"] = dict(self._inference_phases)
+            remaining = [
+                self._inference_min_remaining_tokens.get(request_id, 0)
+                for request_id, phase in self._inference_phases.items()
+                if phase == "decode"
+            ]
+            horizon = {
+                "remaining_tokens": max(remaining, default=0),
+                "aggregate_remaining_tokens": sum(remaining),
+                "decode_requests": len(remaining),
+                "evidence": "vllm_min_tokens_minus_exact_stream_token_ids",
+            }
+        runtime["decode_horizon"] = horizon
         projection["decode_plan"] = self.expert_residency.plan_decode_residency(
             runtime
         )
+        miss_debt = dict(runtime.get("miss_debt") or {})
+        if miss_debt.get("exceeded"):
+            decode_plan = dict(projection.get("decode_plan") or {})
+            capacity_action = str((projection.get("plan") or {}).get("action", ""))
+            decode_plan.update(
+                {
+                    "action": (
+                        "hibernate"
+                        if capacity_action in {"elastic_resident", "hibernate"}
+                        else "yield"
+                    ),
+                    "reason": (
+                        "actual expert load debt exceeded the online decode budget"
+                    ),
+                    "miss_debt": miss_debt,
+                    "executable": False,
+                    "evidence": "runtime_actual_miss_debt_fallback",
+                }
+            )
+            projection["decode_plan"] = decode_plan
         projection["data_plane"] = runtime
         if runtime.get("data_plane_ready"):
             projection["data_plane_ready"] = True
@@ -610,6 +716,13 @@ class PLLMController:
                 plan["executable"] = True
                 plan["data_plane_ready"] = True
                 projection["plan"] = plan
+            decode_plan = dict(projection.get("decode_plan") or {})
+            if decode_plan:
+                decode_plan["executable"] = (
+                    decode_plan.get("action") == "decode_elastic"
+                )
+                decode_plan["data_plane_ready"] = True
+                projection["decode_plan"] = decode_plan
         return projection
 
     def _maybe_auto_resize(self, expert_status: dict[str, Any]) -> bool:
@@ -628,36 +741,134 @@ class PLLMController:
                 return False
             if decode_plan.get("action") != "decode_elastic":
                 return False
-            desired = int(decode_plan.get("slots_per_layer", 0))
+            desired_by_layer = {
+                int(layer): int(slots)
+                for layer, slots in dict(
+                    decode_plan.get("slots_by_layer") or {}
+                ).items()
+            }
+            desired = min(desired_by_layer.values(), default=0)
             retain_policy = "decode_hot"
         else:
             desired = int(
                 expert_status.get("model", {}).get("experts_per_layer", 0)
             )
+            desired_by_layer = {}
             retain_policy = "lru"
         if desired < 22:
+            return False
+        route_trace = expert_status.get("data_plane", {}).get("route_trace", {})
+        capacity_generation = int(capacity_plan.get("generation", 0))
+        if (
+            int(decode_plan.get("request_generation", -1))
+            != int(route_trace.get("request_generation", -2))
+            or int(decode_plan.get("route_generation", -1))
+            != int(route_trace.get("route_generation", -2))
+            or int(decode_plan.get("capacity_generation", -1))
+            != capacity_generation
+        ):
+            return False
+        planned_horizon = int(
+            dict(decode_plan.get("horizon") or {}).get(
+                "planner_lower_bound_tokens", 0
+            )
+        )
+        with self._status_lock:
+            current_horizon = max(
+                self._inference_min_remaining_tokens.values(), default=0
+            )
+        if current_horizon < planned_horizon:
             return False
         layers = (
             expert_status.get("data_plane", {})
             .get("data_plane", {})
             .get("layers", [])
         )
-        current = {int(item.get("slot_count", 0)) for item in layers}
-        if current == {desired}:
+        current_by_layer = {
+            int(item.get("layer", -1)): int(item.get("slot_count", 0))
+            for item in layers
+        }
+        if desired_by_layer:
+            if all(
+                current_by_layer.get(layer) == slots
+                for layer, slots in desired_by_layer.items()
+            ):
+                return False
+        elif set(current_by_layer.values()) == {desired}:
             return False
         if (
             time.monotonic() - self._last_expert_resize_at
             < self.config.expert_resize_cooldown_seconds
         ):
             return False
-        self.expert_dataplane_action(
-            {
-                "action": "resize",
-                "slots_per_layer": desired,
-                "retain_policy": retain_policy,
-            }
-        )
+        fresh_status = getattr(self.expert_runtime, "fresh_status", None)
+        if callable(fresh_status):
+            latest = fresh_status()
+            latest_trace = dict(latest.get("route_trace") or {})
+            if (
+                int(decode_plan.get("request_generation", -1))
+                != int(latest_trace.get("request_generation", -2))
+                or int(decode_plan.get("route_generation", -1))
+                != int(latest_trace.get("route_generation", -2))
+            ):
+                return False
+        payload: dict[str, Any] = {
+            "action": "resize",
+            "retain_policy": retain_policy,
+            "miss_debt_budget_ms": max(
+                1.0,
+                (self.config.decode_max_slowdown_ratio - 1.0)
+                * self.config.decode_baseline_tpot_ms,
+            ),
+        }
+        if desired_by_layer:
+            payload["slots_by_layer"] = desired_by_layer
+        else:
+            payload["slots_per_layer"] = desired
+        self.expert_dataplane_action(payload)
         return True
+
+    def _expert_fallback_action(
+        self, expert_status: dict[str, Any]
+    ) -> tuple[str, int, str] | None:
+        if not (
+            self.config.expert_data_plane_enabled
+            and self.config.expert_auto_resize_enabled
+            and expert_status.get("data_plane_ready")
+        ):
+            return None
+        capacity = dict(expert_status.get("plan") or {})
+        decode = dict(expert_status.get("decode_plan") or {})
+        capacity_action = str(capacity.get("action", ""))
+        decode_action = str(decode.get("action", ""))
+        if capacity_action == "yield":
+            return (
+                "yield",
+                0,
+                "foreground compute envelope requires a token-boundary yield",
+            )
+        if capacity_action == "hibernate" or decode_action == "hibernate":
+            return (
+                "hibernate",
+                2,
+                str(decode.get("reason") or capacity.get("reason") or "capacity fallback"),
+            )
+        if decode.get("planner_pending") and capacity_action == "elastic_resident":
+            return (
+                "yield",
+                0,
+                "foreground fast path yields while the residency planner runs",
+            )
+        if capacity_action == "elastic_resident" and decode_action in {
+            "observe",
+            "yield",
+        }:
+            return (
+                "hibernate",
+                2,
+                "required capacity cannot be released within the decode risk and horizon SLO",
+            )
+        return None
 
 
 def _model_size_gb(model_path: Path) -> float:

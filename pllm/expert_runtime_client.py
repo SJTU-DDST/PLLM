@@ -18,7 +18,7 @@ class ExpertRuntimeClient:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            if self._cached_status and time.monotonic() - self._cached_at < 1.0:
+            if self._cached_status and time.monotonic() - self._cached_at < 0.1:
                 return dict(self._cached_status)
         try:
             result = self.request({"command": "status"}, timeout=1.0)
@@ -37,6 +37,12 @@ class ExpertRuntimeClient:
             self._cached_at = time.monotonic()
         return dict(status)
 
+    def fresh_status(self) -> dict[str, Any]:
+        with self._lock:
+            self._cached_status = {}
+            self._cached_at = 0.0
+        return self.status()
+
     def request(
         self, payload: dict[str, Any], timeout: float | None = None
     ) -> dict[str, Any]:
@@ -54,17 +60,26 @@ class ExpertRuntimeClient:
         return result
 
     def resize(
-        self, slots_per_layer: int, retain_policy: str = "lru"
+        self,
+        slots_per_layer: int | None = None,
+        retain_policy: str = "lru",
+        slots_by_layer: dict[int, int] | None = None,
+        miss_debt_budget_ms: float | None = None,
     ) -> dict[str, Any]:
-        return self.request(
-            {
-                "command": "resize",
-                "slots_per_layer": slots_per_layer,
-                "retain_policy": retain_policy,
-                "quiesced": True,
-            },
-            timeout=max(self.timeout_seconds, 600.0),
-        )
+        payload: dict[str, Any] = {
+            "command": "resize",
+            "retain_policy": retain_policy,
+            "quiesced": True,
+        }
+        if slots_per_layer is not None:
+            payload["slots_per_layer"] = int(slots_per_layer)
+        if slots_by_layer:
+            payload["slots_by_layer"] = {
+                str(layer): int(slots) for layer, slots in slots_by_layer.items()
+            }
+        if miss_debt_budget_ms is not None:
+            payload["miss_debt_budget_ms"] = float(miss_debt_budget_ms)
+        return self.request(payload, timeout=max(self.timeout_seconds, 600.0))
 
     def set_phase(self, phase: str, reset_decode: bool = False) -> dict[str, Any]:
         return self.request(

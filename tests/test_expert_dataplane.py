@@ -46,6 +46,7 @@ class MemorySink:
         self.slot_count = slots
         self.rows: list[bytes | None] = [None] * slots
         self.mapping: dict[int, int] = {}
+        self.publishes = 0
 
     def write(self, slot: int, payload: ExpertPayload) -> None:
         self.rows[slot] = payload.tensor_bytes("w13_weight")
@@ -55,6 +56,7 @@ class MemorySink:
 
     def publish_mapping(self, mapping: dict[int, int], generation: int) -> None:
         del generation
+        self.publishes += 1
         self.mapping = dict(mapping)
 
     def begin_resize(self, slot_count: int) -> None:
@@ -111,6 +113,17 @@ def test_actual_route_miss_loads_exact_expert_before_publish() -> None:
     assert 0 not in sink.mapping
 
 
+def test_route_hit_does_not_republish_an_unchanged_mapping() -> None:
+    sink = MemorySink(2)
+    plane = ExpertSlotDataPlane(MemorySource())
+    plane.register_layer(0, 8, sink, initial_experts=[0, 1])
+    before = sink.publishes
+
+    plane.ensure(0, [0, 1])
+
+    assert sink.publishes == before
+
+
 def test_resize_reloads_retained_experts_from_backing_store() -> None:
     sink = MemorySink(4)
     plane = ExpertSlotDataPlane(MemorySource())
@@ -147,6 +160,35 @@ def test_fast_resize_copies_retained_rows_without_source_reads() -> None:
     assert status["counters"]["resize_time_ns"] > 0
 
 
+def test_destructive_expansion_avoids_dual_allocation_and_reloads_source() -> None:
+    class CountingSource(MemorySource):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def get(self, layer: int, expert: int) -> ExpertPayload:
+            self.reads += 1
+            return super().get(layer, expert)
+
+    source = CountingSource()
+    sink = FastMemorySink(4)
+    plane = ExpertSlotDataPlane(source)
+    plane.register_layer(0, 8, sink, initial_experts=[0, 1, 2, 3])
+    plane.resize(0, 2, retain=[0, 1])
+    reads_before_expand = source.reads
+
+    status = plane.resize(
+        0,
+        4,
+        retain=[0, 1, 2, 3],
+        preserve_retained=False,
+    )
+
+    assert source.reads - reads_before_expand == 4
+    assert status["slot_count"] == 4
+    assert set(status["logical_to_slot"]) == {0, 1, 2, 3}
+
+
 def test_route_misses_are_loaded_as_one_source_batch() -> None:
     class BatchSource(MemorySource):
         def __init__(self) -> None:
@@ -169,6 +211,26 @@ def test_route_misses_are_loaded_as_one_source_batch() -> None:
     status = plane.layer_status(0)
     assert status["counters"]["batch_loads"] == 2
     assert status["counters"]["batch_objects"] == 4
+
+
+def test_data_plane_consumes_chunked_source_before_staging_reuse() -> None:
+    class ChunkSource(MemorySource):
+        def iter_many(self, requests: list[tuple[int, int]]):
+            for begin in range(0, len(requests), 2):
+                yield [self.get(*request) for request in requests[begin : begin + 2]]
+
+    source = ChunkSource()
+    sink = MemorySink(6)
+    plane = ExpertSlotDataPlane(source)
+    plane.register_layer(0, 8, sink, initial_experts=[0, 1])
+
+    mapping = plane.ensure(0, [2, 3, 4, 5])
+
+    assert [sink.rows[mapping[expert]] for expert in (2, 3, 4, 5)] == [
+        bytes([expert]) * 4 for expert in (2, 3, 4, 5)
+    ]
+    status = plane.layer_status(0)
+    assert status["counters"]["batch_loads"] == 3
 
 
 def test_rdma_pool_stream_reuses_one_process_for_multiple_memory_gets(
@@ -238,6 +300,127 @@ def test_rdma_pool_stream_reuses_one_process_for_multiple_memory_gets(
     assert status["gets"] == 3
     assert status["persistent_qp"] is True
     assert status["local_disk_io"] is False
+
+
+def test_rdma_pool_shared_mr_returns_views_without_pipe_payload(
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "fake-shared-pool"
+    binary.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import mmap
+            import struct
+            import sys
+
+            args = sys.argv
+            fd = int(args[args.index("--stream-shm-fd") + 1])
+            size = int(args[args.index("--stream-shm-bytes") + 1])
+            slot = 4096
+            shared = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+            while True:
+                raw = sys.stdin.buffer.read(4)
+                if not raw:
+                    break
+                first = struct.unpack("!I", raw)[0]
+                if first == 0:
+                    break
+                assert first == 0xffffffff
+                count = struct.unpack("!I", sys.stdin.buffer.read(4))[0]
+                for index in range(count):
+                    key_size = struct.unpack("!I", sys.stdin.buffer.read(4))[0]
+                    key = sys.stdin.buffer.read(key_size)
+                    payload = b"shared:" + key
+                    shared[index * slot:index * slot + len(payload)] = payload
+                    sys.stdout.buffer.write(struct.pack("!IQI", 0, len(payload), 0))
+                sys.stdout.buffer.flush()
+            """
+        ),
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    index = tmp_path / "index.tsv"
+    index.write_text("0\ta\t8\n1\tb\t8\n", encoding="utf-8")
+    transport = RDMAPoolStream(
+        "fake",
+        1,
+        binary,
+        index,
+        shared_staging=True,
+        pool_slot_bytes=4096,
+        batch_size=2,
+    )
+
+    payloads = transport.get_many(["a", "b"])
+    status = transport.status()
+
+    assert [bytes(payload) for payload in payloads] == [b"shared:a", b"shared:b"]
+    assert all(isinstance(payload, memoryview) for payload in payloads)
+    assert status["shared_staging"] is True
+    assert status["pipe_payload"] is False
+    del payloads
+    transport.close()
+
+
+def test_rdma_pool_chunk_iterator_consumes_more_than_one_staging_ring(
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "fake-shared-pool"
+    binary.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import argparse, mmap, struct, sys
+            parser = argparse.ArgumentParser(add_help=False)
+            parser.add_argument('--stream-shm-fd', type=int)
+            parser.add_argument('--stream-shm-bytes', type=int)
+            args, _ = parser.parse_known_args()
+            shared = mmap.mmap(args.stream_shm_fd, args.stream_shm_bytes)
+            while True:
+                raw = sys.stdin.buffer.read(4)
+                if not raw:
+                    break
+                first = struct.unpack('!I', raw)[0]
+                if first == 0:
+                    break
+                count = struct.unpack('!I', sys.stdin.buffer.read(4))[0]
+                for index in range(count):
+                    size = struct.unpack('!I', sys.stdin.buffer.read(4))[0]
+                    key = sys.stdin.buffer.read(size)
+                    payload = b'chunk:' + key
+                    shared[index * 4096:index * 4096 + len(payload)] = payload
+                    sys.stdout.buffer.write(struct.pack('!IQI', 0, len(payload), 0))
+                sys.stdout.buffer.flush()
+            """
+        ),
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    index = tmp_path / "index.tsv"
+    index.write_text("0\ta\t7\n1\tb\t7\n", encoding="utf-8")
+    transport = RDMAPoolStream(
+        "fake",
+        1,
+        binary,
+        index,
+        shared_staging=True,
+        pool_slot_bytes=4096,
+        batch_size=2,
+    )
+
+    snapshots = [
+        [bytes(payload) for payload in chunk]
+        for chunk in transport.iter_many(["a", "b", "a", "b", "a"])
+    ]
+
+    assert snapshots == [
+        [b"chunk:a", b"chunk:b"],
+        [b"chunk:a", b"chunk:b"],
+        [b"chunk:a"],
+    ]
+    assert transport.status()["gets"] == 5
+    transport.close()
 
 
 def test_rdma_pool_expert_store_decodes_without_installing_local_file(

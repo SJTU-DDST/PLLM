@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -63,6 +64,8 @@ struct Options {
   std::uint64_t slot_bytes = kDefaultSlotBytes;
   std::size_t queue_depth = 8;
   std::size_t rd_atomic_depth = 16;
+  int stream_shm_fd = -1;
+  std::size_t stream_shm_bytes = 0;
 };
 
 #pragma pack(push, 1)
@@ -208,6 +211,26 @@ class FileDescriptor {
   int value_;
 };
 
+class MappedRegion {
+ public:
+  MappedRegion(int fd, std::size_t size) : size_(size) {
+    if (fd < 0 || size == 0) return;
+    data_ = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data_ == MAP_FAILED) system_error("mmap stream staging");
+  }
+  ~MappedRegion() {
+    if (data_ && data_ != MAP_FAILED) ::munmap(data_, size_);
+  }
+  MappedRegion(const MappedRegion&) = delete;
+  MappedRegion& operator=(const MappedRegion&) = delete;
+  void* data() const { return data_ == MAP_FAILED ? nullptr : data_; }
+  std::size_t size() const { return size_; }
+
+ private:
+  void* data_ = nullptr;
+  std::size_t size_ = 0;
+};
+
 class HostBuffer {
  public:
   HostBuffer(std::size_t size, bool cuda_host, bool initialize)
@@ -232,8 +255,16 @@ class HostBuffer {
     if (initialize) std::memset(data_, 0, size_);
   }
 
+  HostBuffer(void* external, std::size_t size)
+      : data_(external), size_(size), external_(true) {
+    if (!data_ || size_ == 0) {
+      throw std::runtime_error("external buffer must be non-empty");
+    }
+  }
+
   ~HostBuffer() {
     if (!data_) return;
+    if (external_) return;
 #ifdef PLLM_HAS_CUDA
     if (cuda_host_) {
       cudaFreeHost(data_);
@@ -250,6 +281,7 @@ class HostBuffer {
   void* data_ = nullptr;
   std::size_t size_ = 0;
   bool cuda_host_ = false;
+  bool external_ = false;
 };
 
 struct DeviceListDeleter {
@@ -584,13 +616,16 @@ Options parse_options(int argc, char** argv) {
     else if (argument == "--slot-bytes") options.slot_bytes = std::stoull(value());
     else if (argument == "--queue-depth") options.queue_depth = std::stoull(value());
     else if (argument == "--rd-atomic-depth") options.rd_atomic_depth = std::stoull(value());
+    else if (argument == "--stream-shm-fd") options.stream_shm_fd = std::stoi(value());
+    else if (argument == "--stream-shm-bytes") options.stream_shm_bytes = std::stoull(value());
     else if (argument == "--help") {
       std::cout
           << "pllm-rdma-pool --server [--pool-bytes N] [--slot-bytes N]\n"
              "pllm-rdma-pool --client HOST --operation put|get --index FILE "
              "--root DIR [--queue-depth N] [--rd-atomic-depth N]\n"
              "pllm-rdma-pool --client HOST --operation stream-get "
-             "--index FILE [--allocator cuda-host]\n";
+             "--index FILE [--allocator cuda-host] "
+             "[--stream-shm-fd FD --stream-shm-bytes N]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown argument: " + argument);
@@ -628,6 +663,10 @@ Options parse_options(int argc, char** argv) {
   }
   if (options.rd_atomic_depth == 0 || options.rd_atomic_depth > 255) {
     throw std::runtime_error("RDMA read atomic depth must be within [1, 255]");
+  }
+  if ((options.stream_shm_fd >= 0) != (options.stream_shm_bytes > 0)) {
+    throw std::runtime_error(
+        "--stream-shm-fd and --stream-shm-bytes must be provided together");
   }
   return options;
 }
@@ -837,7 +876,8 @@ void finish_session(int socket_fd) {
 
 void write_stream_response(std::uint32_t status, const void* payload,
                            std::size_t payload_size,
-                           std::string_view message = {}) {
+                           std::string_view message = {},
+                           bool write_payload = true) {
   const StreamResponseWire response{
       htonl(status), htobe64(payload_size),
       htonl(static_cast<std::uint32_t>(message.size()))};
@@ -845,7 +885,7 @@ void write_stream_response(std::uint32_t status, const void* payload,
   if (!message.empty()) {
     write_fd_all(STDOUT_FILENO, message.data(), message.size());
   }
-  if (payload_size > 0) {
+  if (write_payload && payload_size > 0) {
     write_fd_all(STDOUT_FILENO, payload, payload_size);
   }
 }
@@ -863,9 +903,19 @@ int run_stream_get(const Options& options, const std::vector<IndexEntry>& rows,
   const std::size_t data_region =
       static_cast<std::size_t>(slot_bytes) * options.queue_depth;
   const std::size_t header_region = kHeaderBytes * options.queue_depth;
-  HostBuffer staging(data_region + header_region,
-                     options.allocator == "cuda-host", false);
-  RdmaEndpoint endpoint(options, staging);
+  MappedRegion shared(options.stream_shm_fd, options.stream_shm_bytes);
+  if (shared.data() != nullptr && shared.size() < data_region + header_region) {
+    throw std::runtime_error("shared stream staging is smaller than one batch");
+  }
+  std::unique_ptr<HostBuffer> staging;
+  if (shared.data() != nullptr) {
+    staging = std::make_unique<HostBuffer>(
+        shared.data(), data_region + header_region);
+  } else {
+    staging = std::make_unique<HostBuffer>(
+        data_region + header_region, options.allocator == "cuda-host", false);
+  }
+  RdmaEndpoint endpoint(options, *staging);
   exchange_connections(socket_fd, endpoint);
   const std::uint64_t stride = kHeaderBytes + slot_bytes;
   std::uint64_t objects = 0;
@@ -915,40 +965,48 @@ int run_stream_get(const Options& options, const std::vector<IndexEntry>& rows,
         if (resolved[index] != nullptr) valid.push_back(index);
       }
       for (std::size_t item = 0; item < valid.size(); ++item) {
-        const auto& row = *resolved[valid[item]];
-        endpoint.post_read(data_region + item * kHeaderBytes,
+        const std::size_t request_index = valid[item];
+        const auto& row = *resolved[request_index];
+        endpoint.post_read(data_region + request_index * kHeaderBytes,
                            row.slot * stride, sizeof(SlotHeaderWire), false);
       }
       for (std::size_t item = 0; item < valid.size(); ++item) {
-        const auto& row = *resolved[valid[item]];
-        endpoint.post_read(item * slot_bytes,
+        const std::size_t request_index = valid[item];
+        const auto& row = *resolved[request_index];
+        endpoint.post_read(request_index * slot_bytes,
                            row.slot * stride + kHeaderBytes,
                            static_cast<std::size_t>(row.size),
                            item + 1 == valid.size());
       }
       if (!valid.empty()) endpoint.poll(1);
       for (std::size_t item = 0; item < valid.size(); ++item) {
+        const std::size_t request_index = valid[item];
         SlotHeaderWire header{};
         std::memcpy(&header,
-                    static_cast<std::byte*>(staging.data()) + data_region +
-                        item * kHeaderBytes,
+                    static_cast<std::byte*>(staging->data()) + data_region +
+                        request_index * kHeaderBytes,
                     sizeof(header));
-        validate_header(header, *resolved[valid[item]]);
+        validate_header(header, *resolved[request_index]);
       }
-      std::size_t valid_item = 0;
-      for (const auto* row : resolved) {
+      for (std::size_t request_index = 0; request_index < resolved.size();
+           ++request_index) {
+        const auto* row = resolved[request_index];
         if (row == nullptr) {
           write_stream_response(1, nullptr, 0,
                                 "key is absent from the warm profile");
           continue;
         }
+        if (shared.data() != nullptr) {
+          // RDMA already landed in the shared mapping at request_index's
+          // staging slot; no pipe or host memcpy is required.
+        }
         write_stream_response(0,
-                              static_cast<std::byte*>(staging.data()) +
-                                  valid_item * slot_bytes,
-                              static_cast<std::size_t>(row->size));
+                              static_cast<std::byte*>(staging->data()) +
+                                  request_index * slot_bytes,
+                              static_cast<std::size_t>(row->size), {},
+                              shared.data() == nullptr);
         ++objects;
         payload_bytes += row->size;
-        ++valid_item;
       }
     } catch (const std::exception& error) {
       for (std::size_t index = 0; index < keys.size(); ++index) {
@@ -960,7 +1018,9 @@ int run_stream_get(const Options& options, const std::vector<IndexEntry>& rows,
   std::cerr << "{\"ready\":true,\"operation\":\"stream-get\","
             << "\"objects\":" << objects << ",\"bytes\":" << payload_bytes
             << ",\"persistent_qp\":true,\"remote_disk_io\":false,"
-               "\"local_disk_io\":false,\"gpudirect_claimed\":false}\n";
+               "\"local_disk_io\":false,\"gpudirect_claimed\":false,"
+            << "\"shared_staging\":"
+            << (shared.data() != nullptr ? "true" : "false") << "}\n";
   return 0;
 }
 

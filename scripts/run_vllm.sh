@@ -41,7 +41,13 @@ if [[ "${PLLM_VLLM_ENABLE_HIBERCACHE:-1}" == "1" ]]; then
   )
 fi
 
-if ! "${HOME}/anaconda3/envs/pllm/bin/python" \
+KV_CACHE_ARGS=()
+if [[ -n "${PLLM_VLLM_KV_CACHE_MEMORY_BYTES:-}" ]]; then
+  KV_CACHE_ARGS+=(--kv-cache-memory-bytes "${PLLM_VLLM_KV_CACHE_MEMORY_BYTES}")
+fi
+
+if ! PLLM_EER_MODE=off PLLM_DECODE_TRACE=0 \
+  "${HOME}/anaconda3/envs/pllm/bin/python" \
   "${PWD}/scripts/apply_vllm_hibercache_patch.py" --check >/dev/null 2>&1; then
   echo "Warning: HiberCache patch is not installed; mode=keep uses token recompute fallback." >&2
 fi
@@ -61,10 +67,11 @@ exec "${VLLM_BIN}" serve "${MODEL_PATH}" \
   --data-parallel-size 1 \
   --trust-remote-code \
   --gpu-memory-utilization "${PLLM_VLLM_GPU_MEMORY_UTILIZATION:-0.85}" \
+  "${KV_CACHE_ARGS[@]}" \
   --enable-chunked-prefill \
-  --max-num-seqs 2 \
+  --max-num-seqs "${PLLM_VLLM_MAX_NUM_SEQS:-2}" \
   --max-num-batched-tokens "${PLLM_VLLM_MAX_BATCHED_TOKENS:-8192}" \
-  --max-model-len 32768 \
+  --max-model-len "${PLLM_VLLM_MAX_MODEL_LEN:-32768}" \
   --linear-backend "${PLLM_VLLM_LINEAR_BACKEND:-cutlass}" \
   --moe-backend marlin \
   --mamba-ssm-cache-dtype float16 \

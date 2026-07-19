@@ -94,15 +94,28 @@ class PLLMConfig:
     expert_assumed_byte_hit_rate: float = 0.95
     expert_assumed_false_prefetch_ratio: float = 0.05
     decode_elastic_enabled: bool = True
+    decode_planner_async: bool = True
     decode_route_window_steps: int = 256
+    decode_horizon_bucket_tokens: int = 128
     decode_min_route_observations: int = 320
     decode_candidate_slots: list[int] = field(
-        default_factory=lambda: [384, 448, 480, 496, 504]
+        default_factory=lambda: [256, 320, 384, 448, 480, 496, 504]
     )
     decode_min_byte_hit_rate: float = 0.95
     decode_max_slowdown_ratio: float = 5.0
     decode_baseline_tpot_ms: float = 100.0
     decode_miss_latency_p95_ms: float = 7.5
+    decode_min_heldout_windows: int = 1
+    decode_target_reclaim_gib: float = 4.0
+    decode_resize_copy_gib_s: float = 100.0
+    decode_expand_gib_s: float = 0.75
+    decode_rebuild_ms_per_layer: float = 5.0
+    decode_miss_batch_sizes: list[int] = field(
+        default_factory=lambda: [1, 2, 4, 8, 16, 22, 32]
+    )
+    decode_miss_batch_p95_ms: list[float] = field(
+        default_factory=lambda: [0.477, 0.784, 1.513, 2.863, 26.223, 42.710, 43.897]
+    )
     loader_mode: str = "auto"
     rdma_peer: str = "192.168.70.71"
     rdma_control_port: int = 18515
@@ -183,7 +196,9 @@ class PLLMConfig:
                 "hiberstate_rdma_ib_port",
                 "hiberstate_rdma_gid_index",
                 "decode_route_window_steps",
+                "decode_horizon_bucket_tokens",
                 "decode_min_route_observations",
+                "decode_min_heldout_windows",
             }:
                 value = int(value)
             if key in {
@@ -205,6 +220,10 @@ class PLLMConfig:
                 "decode_max_slowdown_ratio",
                 "decode_baseline_tpot_ms",
                 "decode_miss_latency_p95_ms",
+                "decode_target_reclaim_gib",
+                "decode_resize_copy_gib_s",
+                "decode_expand_gib_s",
+                "decode_rebuild_ms_per_layer",
             }:
                 value = float(value)
             setattr(self, key, value)

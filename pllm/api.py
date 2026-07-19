@@ -166,7 +166,11 @@ def create_app(controller: PLLMController, storage: Storage) -> Flask:
 
         replay_id = storage.create_replay(payload, "running")
         try:
-            controller.prepare_inference_request(replay_id)
+            controller.prepare_inference_request(
+                replay_id,
+                _positive_int(payload.get("min_tokens")),
+                int(payload.get("n", 1)),
+            )
         except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
             controller.mark_inference_phase("idle", request_id=replay_id)
             storage.update_replay(replay_id, "queued", error=str(exc))
@@ -196,7 +200,11 @@ def create_app(controller: PLLMController, storage: Storage) -> Flask:
         payload["stream"] = False
         storage.update_replay(replay_id, "running")
         try:
-            controller.prepare_inference_request(replay_id)
+            controller.prepare_inference_request(
+                replay_id,
+                _positive_int(payload.get("min_tokens")),
+                int(payload.get("n", 1)),
+            )
         except (OSError, RuntimeError, ValueError, requests.RequestException) as exc:
             controller.mark_inference_phase("idle", request_id=replay_id)
             storage.update_replay(replay_id, "queued", error=str(exc))
@@ -248,9 +256,12 @@ def _stream_chat(
     controller: PLLMController,
 ) -> Response:
     try:
+        backend_payload = dict(payload)
+        client_requested_token_ids = bool(payload.get("return_token_ids"))
+        backend_payload["return_token_ids"] = True
         upstream = requests.post(
             f"{target}/v1/chat/completions",
-            json=payload,
+            json=backend_payload,
             stream=True,
             timeout=(5, None),
         )
@@ -276,19 +287,38 @@ def _stream_chat(
                 if line.startswith(b"data: ") and line != b"data: [DONE]":
                     try:
                         event = json.loads(line[6:])
-                        delta = event["choices"][0].get("delta", {})
+                        choice = event["choices"][0]
+                        delta = choice.get("delta", {})
+                        token_ids = choice.get("token_ids") or []
                         content = delta.get("content")
-                        if content:
+                        if token_ids or content:
                             if not decode_marked:
                                 controller.mark_inference_phase(
                                     "decode", request_id=replay_id
                                 )
                                 decode_marked = True
+                        if content:
                             captured.append(str(content))
+                        if token_ids:
+                            generated_tokens += len(token_ids)
+                            controller.record_decode_progress(
+                                replay_id, len(token_ids), exact=True
+                            )
+                        elif content:
                             generated_tokens += 1
+                            controller.record_decode_progress(
+                                replay_id, 1, exact=False
+                            )
+                        if token_ids or content:
                             storage.update_replay_progress(
                                 replay_id, generated_tokens, "".join(captured)
                             )
+                        if not client_requested_token_ids:
+                            choice.pop("token_ids", None)
+                            event.pop("prompt_token_ids", None)
+                            line = b"data: " + json.dumps(
+                                event, ensure_ascii=False, separators=(",", ":")
+                            ).encode("utf-8")
                     except (ValueError, KeyError, IndexError, TypeError):
                         pass
                 yield line + b"\n"
@@ -326,6 +356,14 @@ def _extract_assistant_text(response: requests.Response) -> str:
         return str(payload["choices"][0]["message"].get("content", ""))
     except (ValueError, KeyError, IndexError, TypeError):
         return ""
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _openai_error(message: str, status: int):

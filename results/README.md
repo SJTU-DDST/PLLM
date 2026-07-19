@@ -22,8 +22,13 @@
   `rdma_memory_pool_live_get_sharded.json` record the 75-to-71 four-QP volatile
   pool run over 15,858,978,307 bytes of real runtime-expert objects. Their
   primary metrics are process-level wall time: 2.545s PUT and 4.012s GET.
-- The cross-host pool files are protocol-v1 evidence. Local v2 smoke results
-  must not be used to claim a cross-host speedup until the same profile is rerun.
+- `rdma_stream_curve/strided-batch-*.json` is the cross-host payload-pipe baseline.
+  `direct-shared-strided-batch-*-n100.json` is the authoritative cross-host
+  direct shared host-MR curve. It spans the full remote object index and verifies
+  returned package bytes, but excludes H2D/UMA copy and Marlin execution.
+- `residency_planner_cpu.json` is a clearly labelled synthetic 40-layer solver
+  stress test. It measures Pareto solve cost and asynchronous dispatch latency;
+  it is not route-locality or GPU evidence.
 - `qa_benchmark/native_full/` contains all 150 per-sample MQA/NQA/TQA
   predictions and the aggregate full-resident baseline. `qa_benchmark/pllm_eer128/`
   and `qa_benchmark/pllm_eer256/` are censored release-capable trials, not zero-F1

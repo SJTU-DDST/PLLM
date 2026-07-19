@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
+import mmap
 import os
 import select
 import struct
@@ -19,6 +21,7 @@ from .expert_catalog import ExpertCatalog
 MAGIC = b"PLLMEX01"
 HEADER = struct.Struct("<8sQ")
 SCHEMA_VERSION = 1
+Buffer = bytes | bytearray | memoryview
 
 
 @dataclass(slots=True, frozen=True)
@@ -42,7 +45,7 @@ class ExpertPayload:
     format: str
     model_fingerprint: str
     tensors: tuple[PackedTensor, ...]
-    data: bytes
+    data: Buffer
     sha256: str
 
     @classmethod
@@ -80,7 +83,7 @@ class ExpertPayload:
             sha256=hashlib.sha256(data).hexdigest(),
         )
 
-    def tensor_bytes(self, name: str) -> bytes:
+    def tensor_bytes(self, name: str) -> Buffer:
         tensor = next((item for item in self.tensors if item.name == name), None)
         if tensor is None:
             raise KeyError(name)
@@ -110,27 +113,28 @@ class ExpertPackageCodec:
         header = json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode(
             "utf-8"
         )
-        return HEADER.pack(MAGIC, len(header)) + header + payload.data
+        return HEADER.pack(MAGIC, len(header)) + header + bytes(payload.data)
 
     @staticmethod
-    def decode(blob: bytes, verify: bool = True) -> ExpertPayload:
+    def decode(blob: Buffer, verify: bool = True) -> ExpertPayload:
         if len(blob) < HEADER.size:
             raise ValueError("expert package is shorter than its fixed header")
-        magic, header_size = HEADER.unpack_from(blob)
+        view = memoryview(blob)
+        magic, header_size = HEADER.unpack_from(view)
         if magic != MAGIC:
             raise ValueError("expert package has an invalid magic")
         header_end = HEADER.size + header_size
         if header_size <= 0 or header_end > len(blob):
             raise ValueError("expert package has an invalid metadata length")
         try:
-            metadata = json.loads(blob[HEADER.size:header_end])
+            metadata = json.loads(bytes(view[HEADER.size:header_end]))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("expert package metadata is invalid") from exc
         if not isinstance(metadata, dict):
             raise ValueError("expert package metadata must be an object")
         if metadata.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("unsupported expert package schema")
-        data = blob[header_end:]
+        data = view[header_end:]
         if int(metadata.get("size_bytes", -1)) != len(data):
             raise ValueError("expert package payload length mismatch")
         tensor_rows = metadata.get("tensors", [])
@@ -147,9 +151,15 @@ class ExpertPackageCodec:
             for item in tensor_rows
         )
         _validate_tensor_layout(tensors, len(data))
-        digest = hashlib.sha256(data).hexdigest()
-        if verify and digest != metadata.get("sha256"):
-            raise ValueError("expert package checksum mismatch")
+        expected_digest = str(metadata.get("sha256", ""))
+        if verify:
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != expected_digest:
+                raise ValueError("expert package checksum mismatch")
+        else:
+            if len(expected_digest) != 64:
+                raise ValueError("expert package checksum metadata is invalid")
+            digest = expected_digest
         return ExpertPayload(
             layer=int(metadata["layer"]),
             expert=int(metadata["expert"]),
@@ -516,6 +526,9 @@ class RDMAPoolStream:
         ib_port: int = 1,
         gid_index: int = 0,
         batch_size: int = 32,
+        shared_staging: bool = False,
+        cuda_register_staging: bool = False,
+        pool_slot_bytes: int = 3 * 1024 * 1024,
     ) -> None:
         if allocator not in {"aligned", "cuda-host"}:
             raise ValueError("RDMA allocator must be aligned or cuda-host")
@@ -532,7 +545,17 @@ class RDMAPoolStream:
         if batch_size <= 0 or batch_size > 32:
             raise ValueError("RDMA pool stream batch size must be within [1, 32]")
         self.batch_size = int(batch_size)
+        if pool_slot_bytes <= 0:
+            raise ValueError("RDMA pool slot bytes must be positive")
+        self.shared_staging = bool(shared_staging)
+        self.cuda_register_staging = bool(cuda_register_staging)
+        self.pool_slot_bytes = int(pool_slot_bytes)
         self._process: subprocess.Popen[bytes] | None = None
+        self._shared_fd: int | None = None
+        self._shared_file: Any | None = None
+        self._shared_map: mmap.mmap | None = None
+        self._cuda_registered_address: int | None = None
+        self._cuda_registration_error = ""
         self._lock = threading.Lock()
         self._gets = 0
         self._bytes = 0
@@ -547,25 +570,43 @@ class RDMAPoolStream:
             and (self.token_file is None or self.token_file.is_file())
         )
 
-    def get(self, key: str | Path) -> bytes:
+    def get(self, key: str | Path) -> Buffer:
         return self.get_many([key])[0]
 
-    def get_many(self, keys: list[str | Path]) -> list[bytes]:
+    def get_many(self, keys: list[str | Path]) -> list[Buffer]:
         if not keys:
             return []
         encoded_keys = [self._encode_key(key) for key in keys]
-        results: list[bytes] = []
+        results: list[Buffer] = []
         with self._lock:
+            copy_views = self.shared_staging and len(encoded_keys) > self.batch_size
             for begin in range(0, len(encoded_keys), self.batch_size):
                 chunk = encoded_keys[begin : begin + self.batch_size]
-                results.extend(self._get_chunk(chunk))
+                payloads = self._get_chunk(chunk)
+                results.extend(
+                    [bytes(payload) for payload in payloads]
+                    if copy_views
+                    else payloads
+                )
         return results
+
+    def iter_many(self, keys: list[str | Path]):
+        """Yield stable-for-this-iteration batches before reusing shared MR slots."""
+        if not keys:
+            return
+        encoded_keys = [self._encode_key(key) for key in keys]
+        with self._lock:
+            for begin in range(0, len(encoded_keys), self.batch_size):
+                yield self._get_chunk(
+                    encoded_keys[begin : begin + self.batch_size]
+                )
 
     def close(self) -> None:
         with self._lock:
             process = self._process
             self._process = None
             if process is None:
+                self._close_shared_staging()
                 return
             try:
                 if process.stdin is not None and process.poll() is None:
@@ -576,6 +617,7 @@ class RDMAPoolStream:
             except (OSError, subprocess.TimeoutExpired):
                 process.kill()
                 process.wait(timeout=3)
+            self._close_shared_staging()
 
     def status(self) -> dict[str, Any]:
         process = self._process
@@ -590,6 +632,11 @@ class RDMAPoolStream:
             "failures": self._failures,
             "persistent_qp": True,
             "batch_size": self.batch_size,
+            "shared_staging": self.shared_staging,
+            "pipe_payload": not self.shared_staging,
+            "chunked_consumer_supported": True,
+            "cuda_host_registered": self._cuda_registered_address is not None,
+            "cuda_host_registration_error": self._cuda_registration_error,
             "remote_disk_io": False,
             "local_disk_io": False,
             "gpudirect_claimed": False,
@@ -624,17 +671,45 @@ class RDMAPoolStream:
             command.extend(["--device", self.device])
         if self.token_file is not None:
             command.extend(["--token-file", str(self.token_file)])
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        pass_fds: tuple[int, ...] = ()
+        if self.shared_staging:
+            shared_bytes = (self.pool_slot_bytes + 64) * self.batch_size
+            shared_file = tempfile.TemporaryFile(
+                prefix="pllm-rdma-pool-", dir="/dev/shm"
+            )
+            fd = shared_file.fileno()
+            os.ftruncate(fd, shared_bytes)
+            shared_map = mmap.mmap(fd, shared_bytes, access=mmap.ACCESS_WRITE)
+            self._shared_file = shared_file
+            self._shared_fd = fd
+            self._shared_map = shared_map
+            if self.cuda_register_staging:
+                self._register_cuda_host(shared_map, shared_bytes)
+            command.extend(
+                [
+                    "--stream-shm-fd",
+                    str(fd),
+                    "--stream-shm-bytes",
+                    str(shared_bytes),
+                ]
+            )
+            pass_fds = (fd,)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                pass_fds=pass_fds,
+            )
+        except Exception:
+            self._close_shared_staging()
+            raise
         self._process = process
         return process
 
-    def _get_chunk(self, encoded_keys: list[bytes]) -> list[bytes]:
+    def _get_chunk(self, encoded_keys: list[bytes]) -> list[Buffer]:
         process = self._ensure_process()
         assert process.stdin is not None
         request = bytearray(struct.pack("!II", 0xFFFFFFFF, len(encoded_keys)))
@@ -646,7 +721,7 @@ class RDMAPoolStream:
             process.stdin.flush()
             results = []
             errors = []
-            for _key in encoded_keys:
+            for response_index, _key in enumerate(encoded_keys):
                 header = self._read_exact(self.RESPONSE.size)
                 status, payload_size, message_size = self.RESPONSE.unpack(header)
                 if message_size > 64 * 1024 or payload_size > 128 * 1024 * 1024:
@@ -654,7 +729,14 @@ class RDMAPoolStream:
                 message = self._read_exact(message_size).decode(
                     "utf-8", errors="replace"
                 )
-                payload = self._read_exact(payload_size)
+                if self.shared_staging and status == 0:
+                    shared = self._shared_map
+                    if shared is None or payload_size > self.pool_slot_bytes:
+                        raise OSError("invalid shared RDMA pool payload")
+                    start = response_index * self.pool_slot_bytes
+                    payload = memoryview(shared)[start : start + payload_size]
+                else:
+                    payload = self._read_exact(payload_size)
                 if status != 0:
                     errors.append(message or "RDMA pool stream GET failed")
                 results.append(payload)
@@ -676,7 +758,7 @@ class RDMAPoolStream:
             raise ValueError("RDMA pool key must contain 1-4096 UTF-8 bytes")
         return encoded
 
-    def _read_exact(self, size: int) -> bytes:
+    def _read_exact(self, size: int) -> Buffer:
         if size == 0:
             return b""
         process = self._process
@@ -684,16 +766,18 @@ class RDMAPoolStream:
             raise OSError("RDMA pool stream is not running")
         descriptor = process.stdout.fileno()
         deadline = time.monotonic() + self.timeout_seconds
-        result = bytearray()
-        while len(result) < size:
+        result = bytearray(size)
+        view = memoryview(result)
+        offset = 0
+        while offset < size:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("RDMA pool stream response timed out")
             readable, _, _ = select.select([descriptor], [], [], remaining)
             if not readable:
                 raise TimeoutError("RDMA pool stream response timed out")
-            block = os.read(descriptor, size - len(result))
-            if not block:
+            count = os.readv(descriptor, [view[offset:]])
+            if count == 0:
                 error = b""
                 if process.stderr is not None:
                     error = process.stderr.read() or b""
@@ -701,8 +785,58 @@ class RDMAPoolStream:
                     "RDMA pool stream closed: "
                     + error.decode("utf-8", errors="replace").strip()
                 )
-            result.extend(block)
-        return bytes(result)
+            offset += count
+        return result
+
+    def _close_shared_staging(self) -> None:
+        shared = self._shared_map
+        fd = self._shared_fd
+        shared_file = self._shared_file
+        self._shared_map = None
+        self._shared_fd = None
+        self._shared_file = None
+        self._unregister_cuda_host()
+        if shared is not None:
+            try:
+                shared.close()
+            except BufferError:
+                # A caller may still be finishing an H2D copy from a returned
+                # view; the mapping is released with process teardown.
+                pass
+        if shared_file is not None:
+            shared_file.close()
+        elif fd is not None:
+            os.close(fd)
+
+    def _register_cuda_host(self, shared: mmap.mmap, size: int) -> None:
+        try:
+            import torch
+
+            address = ctypes.addressof(ctypes.c_char.from_buffer(shared))
+            error = torch.cuda.cudart().cudaHostRegister(address, size, 0)
+            if int(error) != 0:
+                raise RuntimeError(f"cudaHostRegister returned {int(error)}")
+            self._cuda_registered_address = address
+            self._cuda_registration_error = ""
+        except Exception as exc:
+            self._cuda_registered_address = None
+            self._cuda_registration_error = f"{type(exc).__name__}: {exc}"
+
+    def _unregister_cuda_host(self) -> None:
+        address = self._cuda_registered_address
+        self._cuda_registered_address = None
+        if address is None:
+            return
+        try:
+            import torch
+
+            error = torch.cuda.cudart().cudaHostUnregister(address)
+            if int(error) != 0:
+                self._cuda_registration_error = (
+                    f"cudaHostUnregister returned {int(error)}"
+                )
+        except Exception as exc:
+            self._cuda_registration_error = f"{type(exc).__name__}: {exc}"
 
 
 class RDMAPoolExpertStore:
@@ -718,7 +852,7 @@ class RDMAPoolExpertStore:
         self.local_layout = local_layout
         self.verify_hot_path = verify_hot_path
         self._keys = self._read_keys(transport.index_file)
-        self._primed: dict[str, bytes] = {}
+        self._primed: dict[str, Buffer] = {}
         self._prime_error = ""
 
     def contains(self, layer: int, expert: int) -> bool:
@@ -740,7 +874,7 @@ class RDMAPoolExpertStore:
         missing = [key for key in keys if key not in self._keys]
         if missing:
             raise KeyError(f"experts are absent from the warm profile: {missing[:4]}")
-        blobs: list[bytes | None] = [None] * len(keys)
+        blobs: list[Buffer | None] = [None] * len(keys)
         remote_indexes = []
         remote_keys = []
         for index, key in enumerate(keys):
@@ -763,6 +897,43 @@ class RDMAPoolExpertStore:
             self.local_layout._validate(payload, layer, expert)
         return payloads
 
+    def iter_many(self, requests: list[tuple[int, int]]):
+        """Decode one shared-MR batch at a time so consumers can copy before reuse."""
+        if not requests:
+            return
+        for begin in range(0, len(requests), self.transport.batch_size):
+            chunk = requests[begin : begin + self.transport.batch_size]
+            keys = [self._key(layer, expert) for layer, expert in chunk]
+            missing = [key for key in keys if key not in self._keys]
+            if missing:
+                raise KeyError(
+                    f"experts are absent from the warm profile: {missing[:4]}"
+                )
+            blobs: list[Buffer | None] = [None] * len(keys)
+            remote_indexes: list[int] = []
+            remote_keys: list[str] = []
+            for index, key in enumerate(keys):
+                primed = self._primed.pop(key, None)
+                if primed is None:
+                    remote_indexes.append(index)
+                    remote_keys.append(key)
+                else:
+                    blobs[index] = primed
+            if remote_keys:
+                remote = self.transport.get_many(remote_keys)
+                for index, blob in zip(remote_indexes, remote):
+                    blobs[index] = blob
+            payloads = [
+                ExpertPackageCodec.decode(blob, verify=self.verify_hot_path)
+                for blob in blobs
+                if blob is not None
+            ]
+            if len(payloads) != len(chunk):
+                raise RuntimeError("RDMA pool returned an incomplete expert batch")
+            for payload, (layer, expert) in zip(payloads, chunk):
+                self.local_layout._validate(payload, layer, expert)
+            yield payloads
+
     def status(self) -> dict[str, Any]:
         result = self.transport.status()
         result["profile_objects"] = len(self._keys)
@@ -776,7 +947,7 @@ class RDMAPoolExpertStore:
             return
         key = min(self._keys)
         try:
-            self._primed[key] = self.transport.get(key)
+            self._primed[key] = bytes(self.transport.get(key))
             self._prime_error = ""
         except Exception as exc:
             self._prime_error = f"{type(exc).__name__}: {exc}"
@@ -855,6 +1026,30 @@ class TieredExpertSource:
         if any(payload is None for payload in result):
             raise RuntimeError("tiered expert batch is incomplete")
         return [payload for payload in result if payload is not None]
+
+    def iter_many(self, requests: list[tuple[int, int]]):
+        if not requests:
+            return
+        source_indexes = [
+            next(
+                (
+                    candidate
+                    for candidate, source in enumerate(self.sources)
+                    if source.contains(*request)
+                ),
+                -1,
+            )
+            for request in requests
+        ]
+        if any(index < 0 for index in source_indexes):
+            raise FileNotFoundError("one or more experts have no configured source")
+        if len(set(source_indexes)) == 1:
+            source = self.sources[source_indexes[0]]
+            iterator = getattr(source, "iter_many", None)
+            if callable(iterator):
+                yield from iterator(requests)
+                return
+        yield self.get_many(requests)
 
 
 def model_fingerprint(model_root: str | Path) -> str:

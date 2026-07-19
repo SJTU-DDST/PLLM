@@ -134,9 +134,9 @@
           </div>
           <div class="expert-metrics">
             <div><span>推理相位</span><strong>{{ routeTrace.phase || 'idle' }}</strong></div>
-            <div><span>{{ expertResidency.data_plane_ready ? '实时 Slots' : '候选 Slots' }}</span><strong>{{ expertActiveSlots || '--' }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
+            <div><span>{{ expertResidency.data_plane_ready ? '逐层实时 Slots' : '逐层候选 Slots' }}</span><strong>{{ expertSlotLabel }}<small>/{{ expertModel.experts_per_layer || 512 }}</small></strong></div>
             <div><span>投影释放</span><strong>{{ metric(expertPlan.projected_reclaim_gib, ' GiB', 1) }}</strong></div>
-            <div><span>路由观测</span><strong>{{ routeTrace.decode_observations ?? expertPlan.observations ?? 0 }}</strong></div>
+            <div><span>跨窗证据</span><strong>{{ nextWindow.minimum_completed_windows || 0 }}<small> windows</small></strong></div>
             <div><span>投影命中</span><strong>{{ percent(expertPlan.projected_byte_hit_rate) }}</strong></div>
             <div><span>延迟上界</span><strong>{{ ratio(expertPlan.estimated_slowdown_ratio) }}</strong></div>
             <div><span>KV/Mamba 状态</span><strong>{{ formatBytes(stateIsland.allocated_bytes) }}</strong></div>
@@ -150,7 +150,7 @@
             <i data-lucide="route"></i>
             <strong>{{ expertPlan.action || 'awaiting_plan' }}</strong>
             <span>{{ expertPlan.reason || expertResidency.guardrail || 'recommendation_only_no_vllm_weight_mutation' }}</span>
-            <em>Top-k {{ expertModel.top_k || 22 }} · {{ routeTrace.phase || 'idle' }} · &lt;10x HARD GUARD</em>
+            <em>Top-k {{ expertModel.top_k || 22 }} · horizon {{ expertPlan.horizon?.remaining_tokens || 0 }} · &lt;5x SLO</em>
             <button class="apply-expert" :disabled="!expertPlan.executable || expertActionBusy" @click="applyExpertPlan" title="应用物理专家槽位">
               <i data-lucide="refresh-cw"></i><span>{{ expertActionBusy ? '切换中' : '应用槽位' }}</span>
             </button>
@@ -158,7 +158,7 @@
           <div class="expert-data-line" :class="{ live: expertDataPlane.data_plane_ready }">
             <span><i data-lucide="copy"></i> resize GPU-copy retained rows</span>
             <span><i data-lucide="network"></i> miss source {{ expertDataPlane.rdma?.enabled ? expertDataPlane.rdma.peer : 'local NVMe fallback' }}</span>
-            <span><i data-lucide="shield-check"></i> state island {{ stateIsland.resize_guard?.preserved === true ? 'preserved' : 'pending validation' }}</span>
+            <span><i data-lucide="shield-check"></i> state island {{ stateIsland.resize_guard?.preserved === true ? (stateIsland.resize_guard?.content_sampled ? 'allocation + sampled content preserved' : 'allocation preserved') : 'pending validation' }}</span>
           </div>
         </section>
 

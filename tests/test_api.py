@@ -12,6 +12,8 @@ class FakeController:
         self.active = active
         self.action_calls = []
         self.phase_calls = []
+        self.progress_calls = []
+        self.prepare_calls = []
 
     def status(self):
         return {
@@ -80,8 +82,18 @@ class FakeController:
     def mark_inference_phase(self, phase, reset_decode=False, request_id=""):
         self.phase_calls.append((phase, reset_decode, request_id))
 
-    def prepare_inference_request(self, request_id):
-        self.mark_inference_phase("prefill", True, request_id)
+    def prepare_inference_request(
+        self, request_id, minimum_decode_tokens=None, sequence_count=1
+    ):
+        if sequence_count != 1:
+            raise RuntimeError("PhaseEER requires exactly one sequence per request")
+        self.prepare_calls.append(
+            (request_id, minimum_decode_tokens, sequence_count)
+        )
+        self.mark_inference_phase("prefill", False, request_id)
+
+    def record_decode_progress(self, request_id, token_delta=1, *, exact=True):
+        self.progress_calls.append((request_id, token_delta, exact))
 
 
 def test_proxy_records_completed_request(mock_vllm_url: str, tmp_path: Path) -> None:
@@ -102,7 +114,7 @@ def test_proxy_records_completed_request(mock_vllm_url: str, tmp_path: Path) -> 
     assert replay["status"] == "completed"
     assert replay["response_text"] == "Mock response: hello"
     assert [(phase, reset) for phase, reset, _ in controller.phase_calls] == [
-        ("prefill", True),
+        ("prefill", False),
         ("idle", False),
     ]
     assert {request_id for _, _, request_id in controller.phase_calls} == {
@@ -124,6 +136,26 @@ def test_paused_proxy_queues_replay(mock_vllm_url: str, tmp_path: Path) -> None:
     replay = storage.get_replay(response.headers["X-PLLM-Replay-ID"])
     assert replay is not None
     assert replay["status"] == "queued"
+
+
+def test_phase_eer_rejects_multi_sequence_requests(
+    mock_vllm_url: str, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "events.sqlite3")
+    app = create_app(FakeController(mock_vllm_url), storage)
+    client = app.test_client()
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "mock",
+            "n": 2,
+            "messages": [{"role": "user", "content": "two"}],
+        },
+    )
+
+    assert response.status_code == 503
+    assert "full prefill residency" in response.json["error"]["message"]
 
 
 def test_control_action_endpoint(mock_vllm_url: str, tmp_path: Path) -> None:
@@ -233,6 +265,7 @@ def test_stream_persists_incremental_output(
         json={
             "model": "mock",
             "stream": True,
+            "min_tokens": 4,
             "messages": [{"role": "user", "content": "stream me"}],
         },
         buffered=True,
@@ -244,8 +277,13 @@ def test_stream_persists_incremental_output(
     assert replay["status"] == "completed"
     assert replay["generated_tokens"] > 0
     assert replay["response_text"] == "Mock response: stream me "
+    assert b'"token_ids"' not in response.data
+    assert all(exact for _, _, exact in controller.progress_calls)
+    assert controller.prepare_calls == [
+        (response.headers["X-PLLM-Replay-ID"], 4, 1)
+    ]
     assert [(phase, reset) for phase, reset, _ in controller.phase_calls] == [
-        ("prefill", True),
+        ("prefill", False),
         ("decode", False),
         ("idle", False),
     ]

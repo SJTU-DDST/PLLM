@@ -72,10 +72,12 @@ def chat():
     answer = f"Mock response: {prompt}"
     if payload.get("stream"):
         def generate():
-            for word in answer.split():
+            for token_id, word in enumerate(answer.split(), start=1):
                 while STATE["sleeping"]:
                     time.sleep(0.01)
                 event = {"choices": [{"delta": {"content": word + " "}}]}
+                if payload.get("return_token_ids"):
+                    event["choices"][0]["token_ids"] = [token_id]
                 yield f"data: {json.dumps(event)}\n\n"
                 time.sleep(0.02)
             yield "data: [DONE]\n\n"

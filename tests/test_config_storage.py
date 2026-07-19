@@ -25,7 +25,7 @@ def test_config_round_trip(tmp_path: Path) -> None:
     assert loaded.expert_io_budget_gib_s == 1.25
     assert loaded.expert_data_plane_enabled is True
     assert loaded.expert_auto_resize_enabled is False
-    assert loaded.decode_candidate_slots == [384, 448, 480, 496, 504]
+    assert loaded.decode_candidate_slots == [256, 320, 384, 448, 480, 496, 504]
 
 
 def test_runtime_dir_uses_system_runtime_when_configured_directory_is_missing(
