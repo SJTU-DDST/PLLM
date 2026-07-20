@@ -363,6 +363,7 @@ python scripts/run_peer_review.py --rounds 4
 - [项目报告](docs/PLLM项目报告.md)
 - [暂停恢复技术调研](docs/主流推理框架暂停恢复调研.md)
 - [演示视频脚本](docs/演示视频脚本.md)
+- [DGX Spark 黑客松演示视频](https://alumnisjtuedu-my.sharepoint.com/:v:/g/personal/cong258258_alumni_sjtu_edu_cn/IQDBQ9qmB_bZRankcW0429SGAX88492VVueX_xCZ5JguZv4?e=2ageR8)
 - [DGX Spark 黑客松十日谈](https://alumnisjtuedu-my.sharepoint.com/:w:/g/personal/cong258258_alumni_sjtu_edu_cn/IQAKso6t_M5MRIciYNYE9xo8ATOk_BnoRPakXdcfrgs4Vi4?e=shrDkp)
 
 ## AI 协助声明
