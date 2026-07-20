@@ -16,29 +16,15 @@ const EMPTY_STATUS = {
   services: [],
 };
 
-const DEMO_STEPS = [
-  { state: "active", workload: "idle", reason: "Prefill 全驻留：Nemotron 正在生成 CUDA 代码", gpu: 68, mem: 28, progress: 0, token: 184, phase: "prefill", observations: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
-  { state: "yielding", workload: "creative", reason: "Blender 激活；prefill 护栏先在 token 边界冻结，不驱逐专家", gpu: 52, mem: 49, progress: 22, token: 193, phase: "prefill", observations: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
-  { state: "active", workload: "creative", reason: "第一个 decode 窗只训练预测器；不使用同窗命中率做决定", gpu: 48, mem: 46, progress: 38, token: 320, phase: "decode", observations: 10240, windows: 1, horizon: 512, expert: { action: "observe", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
-  { state: "elastic_resident", workload: "creative", reason: "SCENARIO：过去窗在下一窗验证后，仅收缩 11 个高局部性层", gpu: 41, mem: 51, progress: 72, token: 576, phase: "decode", observations: 20480, windows: 2, horizon: 256, variableLayers: 11, expert: { action: "decode_elastic", slots: 384, resident: 70.72, reclaim: 4.06, hit: 0.994, slowdown: 1.82 } },
-  { state: "hibernated", workload: "memory_pressure", reason: "若逐层方案仍不满足容量或 <5x SLO，则停止 paging 并升级 Level 2", gpu: 8, mem: 18, progress: 100, token: 576, phase: "idle", observations: 20480, windows: 2, horizon: 0, reclaimed: 72.0, expert: { action: "hibernate", slots: 512, resident: 74.783, reclaim: 0, hit: 0.994, slowdown: null } },
-  { state: "restoring", workload: "idle", reason: "前台退出；优先从 Remote DRAM 暖源恢复，NVMe 仅回退", gpu: 34, mem: 24, progress: 63, token: 215, phase: "idle", observations: 0, reclaimed: 72.0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
-  { state: "active", workload: "idle", reason: "恢复完整驻留，请求从 token 215 继续", gpu: 61, mem: 27, progress: 100, token: 239, phase: "decode", observations: 320, reclaimed: 0, expert: { action: "full_resident", slots: 512, resident: 74.783, reclaim: 0, hit: 1, slowdown: 1 } },
-];
-
 createApp({
   data() {
     return {
       status: structuredClone(EMPTY_STATUS),
-      replayStatus: structuredClone(EMPTY_STATUS),
       capabilities: {},
       events: [],
       experiments: [],
       replays: [],
       samples: [],
-      judgeMode: false,
-      demoPlaying: false,
-      demoIndex: 0,
       expertPreset: "creative",
       expertActionBusy: false,
       busy: false,
@@ -47,25 +33,23 @@ createApp({
       compiledPolicy: "",
       eventSource: null,
       pollTimer: null,
-      demoTimer: null,
     };
   },
   computed: {
-    activeStatus() { return this.judgeMode ? this.replayStatus : this.status; },
+    activeStatus() { return this.status; },
     sensor() { return this.activeStatus.sensor || {}; },
     stateClass() { return `state-${this.activeStatus.state || "error"}`; },
     backendAvailable() {
-      return this.judgeMode || (this.activeStatus.services || []).some((service) => service.healthy && service.controllable);
+      return (this.activeStatus.services || []).some((service) => service.healthy && service.controllable);
     },
     stateLabel() {
       if (this.activeStatus.state === "active" && !this.backendAvailable) return "监控运行中";
       return ({ active: "推理运行中", elastic_resident: "弹性专家驻留", yielding: "Token 边界冻结", quiescing: "正在释放资源", hibernated: "已深度休眠", restoring: "正在恢复", error: "需要处理" })[this.activeStatus.state] || this.activeStatus.state;
     },
     mockBackend() {
-      return !this.judgeMode && (this.activeStatus.services || []).some((service) => String(service.model || "").startsWith("mock-"));
+      return (this.activeStatus.services || []).some((service) => String(service.model || "").startsWith("mock-"));
     },
     dataModeLabel() {
-      if (this.judgeMode) return "SCENARIO REPLAY · NOT MEASURED";
       return this.mockBackend ? "LIVE SENSORS · MOCK BACKEND" : "LIVE CONTROL";
     },
     headline() {
@@ -75,7 +59,6 @@ createApp({
     },
     foregroundName() {
       const foreground = this.sensor.foreground || {};
-      if (this.judgeMode) return this.demoIndex >= 1 && this.demoIndex <= 4 ? "Blender" : "GNOME Desktop";
       return foreground.wm_class || foreground.app_id || foreground.title || "未识别";
     },
     memoryMetric() {
@@ -116,7 +99,6 @@ createApp({
     },
     expertEvidenceLabel() {
       if (this.expertResidency.data_plane_ready) return "LIVE DATA PLANE";
-      if (this.judgeMode) return "SCENARIO · NOT MEASURED";
       return "CONTROL PLANE ONLY";
     },
     expertLayerCells() {
@@ -158,10 +140,9 @@ createApp({
       const labels = ["ACTIVE", "ELASTIC", "YIELD", "COMMIT", "HIBERNATED", "RESTORE"];
       const details = ["完整驻留", "专家收缩", "冻结", "事务提交", "慢层驻留", "渐进装载"];
       const current = ids.indexOf(this.activeStatus.state);
-      return ids.map((id, index) => ({ id, label: labels[index], detail: details[index], active: id === this.activeStatus.state, done: current > index || (this.activeStatus.state === "active" && this.demoIndex > 0) }));
+      return ids.map((id, index) => ({ id, label: labels[index], detail: details[index], active: id === this.activeStatus.state, done: current > index }));
     },
     activeReplays() {
-      if (this.judgeMode) return [{ id: "demo-request", status: this.activeStatus.state === "active" ? "running" : "paused", request: { messages: [{ content: "实现一个 CUDA kernel 并解释性能瓶颈" }] }, generated_tokens: DEMO_STEPS[this.demoIndex]?.token, paused_at_token: DEMO_STEPS[this.demoIndex]?.token }];
       return this.replays.filter((item) => ["running", "paused", "queued", "aborted"].includes(item.status));
     },
     capabilityRows() {
@@ -181,23 +162,8 @@ createApp({
       ];
     },
     capabilityReady() { return this.capabilityRows.filter((item) => item.ready).length; },
-    displayExperiments() {
-      if (!this.judgeMode) return this.experiments.slice(0, 5);
-      return [
-        { id: "demo-1", name: "Decode 496-slot policy", variant: "scenario · not measured", created_at: Date.now() / 1000, metrics: { projected_reclaim_gib: 1.846 } },
-        { id: "demo-2", name: "stream continuity", variant: "mock validated", created_at: Date.now() / 1000 - 80, metrics: { duplicate_tokens: 0, missing_tokens: 0 } },
-        ...this.experiments.slice(0, 3),
-      ];
-    },
-    displayEvents() {
-      if (!this.judgeMode) return this.events;
-      return [
-        { id: "d1", event_type: "expert_dataplane", reason: "scenario: decode 496-slot candidate", created_at: Date.now() / 1000 - 22 },
-        { id: "d2", event_type: "wake", reason: "scenario: Remote DRAM warm restore", created_at: Date.now() / 1000 - 11 },
-        ...this.events,
-      ];
-    },
-    eventMarker() { return Math.max(0, Math.min(720, this.demoIndex * 144)); },
+    displayExperiments() { return this.experiments.slice(0, 5); },
+    displayEvents() { return this.events; },
   },
   methods: {
     metric(value, suffix = "", precision = 0) { return value == null || Number.isNaN(Number(value)) ? "--" : `${Number(value).toFixed(precision)}${suffix}`; },
@@ -231,7 +197,15 @@ createApp({
     connectTelemetry() {
       if (this.eventSource) this.eventSource.close();
       this.eventSource = new EventSource("/api/v1/telemetry/stream?interval=0.5");
-      this.eventSource.addEventListener("status", (event) => { this.status = JSON.parse(event.data); this.pushSample(this.status); this.refreshIcons(); });
+      this.eventSource.addEventListener("status", (event) => {
+        try {
+          this.status = JSON.parse(event.data);
+          this.pushSample(this.status);
+          this.refreshIcons();
+        } catch (_) {
+          this.pollStatus();
+        }
+      });
       this.eventSource.onerror = () => {
         this.eventSource?.close(); this.eventSource = null;
         if (!this.pollTimer) this.pollTimer = window.setInterval(() => this.pollStatus(), 1500);
@@ -253,7 +227,6 @@ createApp({
       return rows.map((row, index) => `${index / Math.max(1, rows.length - 1) * 720},${210 - Number(row[key] || 0) * 1.9}`).join(" ");
     },
     async runAction(action) {
-      if (this.judgeMode && action !== "benchmark") { this.showToast("评委模式不会修改实时服务", "info"); return; }
       this.busy = true;
       try {
         const result = await this.api("/api/v1/actions", { method: "POST", body: JSON.stringify({ action }) });
@@ -269,10 +242,6 @@ createApp({
         creative: { workload: "creative", byte_hit_rate: 0.95, false_prefetch_ratio: 0.05, envelope: { foreground_reserve_gib: 64, compute_duty_cycle: 0.35, io_budget_gib_s: 2 } },
         emergency: { workload: "memory_pressure", byte_hit_rate: 0.8, false_prefetch_ratio: 0.2, envelope: { foreground_reserve_gib: 104, compute_duty_cycle: 0.1, io_budget_gib_s: 0.5 } },
       };
-      if (this.judgeMode) {
-        const demoMap = { idle: 0, creative: 1, emergency: 3 };
-        this.demoIndex = demoMap[preset]; this.applyDemoStep(this.demoIndex); return;
-      }
       try {
         const result = await this.api("/api/v1/expert-residency/plan", { method: "POST", body: JSON.stringify(inputs[preset]) });
         this.status.expert_residency = result;
@@ -303,28 +272,6 @@ createApp({
         this.expertActionBusy = false;
         this.refreshIcons();
       }
-    },
-    setJudgeMode(enabled) {
-      this.judgeMode = enabled;
-      this.stopJudgeDemo();
-      if (enabled) { this.demoIndex = 0; this.applyDemoStep(0); }
-      this.refreshIcons();
-    },
-    playJudgeDemo() {
-      this.stopJudgeDemo(); this.demoPlaying = true; this.demoIndex = 0; this.samples = [];
-      this.applyDemoStep(0);
-      this.demoTimer = window.setInterval(() => {
-        this.demoIndex += 1;
-        if (this.demoIndex >= DEMO_STEPS.length) { this.stopJudgeDemo(); this.demoIndex = DEMO_STEPS.length - 1; return; }
-        this.applyDemoStep(this.demoIndex);
-      }, 1300);
-    },
-    stopJudgeDemo() { if (this.demoTimer) window.clearInterval(this.demoTimer); this.demoTimer = null; this.demoPlaying = false; },
-    applyDemoStep(index) {
-      const step = DEMO_STEPS[index];
-      const slotsByLayer = Object.fromEntries(Array.from({ length: 40 }, (_, layer) => [String(layer + 1), step.variableLayers && layer < step.variableLayers ? step.expert.slots : 512]));
-      this.replayStatus = { ...structuredClone(EMPTY_STATUS), state: step.state, workload: step.workload, reason: step.reason, transition_progress: step.progress, reclaimed_gb: step.reclaimed ?? null, last_action_duration_ms: null, restore_source: "remote_dram", pause_mode: "keep", sleep_level: ["quiescing", "hibernated", "restoring"].includes(step.state) ? 2 : 0, sensor: { gpu_available: true, gpu_name: "NVIDIA GB10", gpu_util: step.gpu, memory_total_gb: 128, memory_available_gb: 128 - step.mem, power_watts: step.state === "hibernated" ? 42 : 87, uma: true, foreground: { wm_class: index >= 1 && index <= 4 ? "Blender" : "GNOME Desktop" } }, hibercache: { enabled: true, root: "/mnt/ssd-storage/pllm-cache", used_gb: 12.8 }, expert_residency: { available: true, backend: "scenario_replay", data_plane_ready: false, evidence: "policy_scenario_not_measurement", model: { moe_layers: 40, experts_per_layer: 512, top_k: 22, routed_expert_gib: 59.063, non_routed_gib: 15.72, average_expert_mib: 2.953 }, plan: { action: "elastic_resident", slots_per_layer: step.expert.slots, evidence: "policy_scenario_not_measurement" }, decode_plan: { action: step.expert.action, slots_per_layer: step.expert.slots, slots_by_layer: slotsByLayer, resident_weight_gib: step.expert.resident, projected_reclaim_gib: step.expert.reclaim, projected_byte_hit_rate: step.expert.hit, estimated_slowdown_ratio: step.expert.slowdown, observations: step.observations, horizon: { remaining_tokens: step.horizon || 0 }, exact_route_required: true, executable: false, data_plane_ready: false, evidence: "policy_scenario_not_measurement" }, data_plane: { route_trace: { phase: step.phase, decode_observations: step.observations, next_window: { prediction_ready: (step.windows || 0) >= 2, minimum_completed_windows: step.windows || 0 } }, state_island: { attached: true, allocated_bytes: 441450496, copy_bytes: 7680, resize_guard: { checked: true, preserved: true, content_sampled: true } } } }, decision: { score: step.state === "yielding" ? 0.42 : 0.71, reason: step.reason, costs: { yield: step.state === "yielding" ? 0.42 : 2.84, hibernate: 0.71, restore_penalty: 0.12 } } };
-      this.pushSample(this.replayStatus); this.refreshIcons();
     },
     async compilePolicy() {
       this.busy = true;
@@ -366,5 +313,5 @@ createApp({
     this.connectTelemetry(); this.refreshIcons();
     window.setInterval(() => this.loadSupportingData(), 5000);
   },
-  beforeUnmount() { this.eventSource?.close(); window.clearInterval(this.pollTimer); this.stopJudgeDemo(); },
+  beforeUnmount() { this.eventSource?.close(); window.clearInterval(this.pollTimer); },
 }).mount("#app");

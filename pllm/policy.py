@@ -65,6 +65,22 @@ class PolicyEngine:
                     plan.score,
                     plan.costs,
                 )
+            if (
+                state == ControllerState.YIELDING
+                and mode == PolicyMode.FOREGROUND_PRIORITY
+                and workload == WorkloadClass.CREATIVE
+                and self._pressure_since is not None
+                and now - self._pressure_since
+                >= max(0.0, self.config.creative_hold_seconds * 2)
+            ):
+                level = self.choose_sleep_level(snapshot, workload)
+                return Decision(
+                    "hibernate",
+                    f"foreground-priority yield escalated: {reason}",
+                    workload,
+                    level,
+                    "keep",
+                )
             if workload != WorkloadClass.IDLE:
                 self._safe_since = None
                 return Decision(workload=workload, reason=reason)
@@ -206,6 +222,21 @@ class PolicyEngine:
             return 2
         if workload in {WorkloadClass.MEMORY_PRESSURE, WorkloadClass.POWER_PRESSURE}:
             return 2
+        if workload == WorkloadClass.CREATIVE:
+            foreground_usage = next(
+                (
+                    item
+                    for item in snapshot.processes
+                    if item.pid == snapshot.foreground.pid
+                ),
+                None,
+            )
+            if foreground_usage is not None and max(
+                foreground_usage.sm_util,
+                foreground_usage.encoder_util,
+                foreground_usage.decoder_util,
+            ) >= 90:
+                return 2
         required = self.model_size_gb * 1.15 + self.config.hot_sleep_memory_reserve_gb
         return 1 if snapshot.memory_available_gb >= required else 2
 

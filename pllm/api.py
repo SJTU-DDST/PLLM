@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -8,14 +9,32 @@ from typing import Any
 
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
+from flask.json.provider import DefaultJSONProvider
 
 from .controller import PLLMController
 from .storage import Storage
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+class _SafeJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj: Any, **kwargs: Any) -> str:
+        kwargs["allow_nan"] = False
+        return super().dumps(_json_safe(obj), **kwargs)
+
+
 def create_app(controller: PLLMController, storage: Storage) -> Flask:
     frontend = Path(__file__).resolve().parent.parent / "frontend"
     app = Flask(__name__, static_folder=str(frontend), static_url_path="/assets")
+    app.json = _SafeJSONProvider(app)
 
     @app.get("/")
     def dashboard():
@@ -39,7 +58,7 @@ def create_app(controller: PLLMController, storage: Storage) -> Flask:
 
         def generate():
             while True:
-                payload = json.dumps(controller.status(), ensure_ascii=False)
+                payload = app.json.dumps(controller.status(), ensure_ascii=False)
                 yield f"event: status\ndata: {payload}\n\n"
                 time.sleep(interval)
 
@@ -175,7 +194,7 @@ def create_app(controller: PLLMController, storage: Storage) -> Flask:
             controller.mark_inference_phase("idle", request_id=replay_id)
             storage.update_replay(replay_id, "queued", error=str(exc))
             response, status_code = _openai_error(
-                f"PLLM could not restore full prefill residency; replay_id={replay_id}",
+                f"PLLM could not prepare exact expert residency; replay_id={replay_id}",
                 503,
             )
             response.headers["X-PLLM-Replay-ID"] = replay_id

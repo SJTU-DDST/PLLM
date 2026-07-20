@@ -4,16 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#111513" />
-    <title>PLLM HiberFlow-EER</title>
+    <title>PLLM HiberFlow</title>
+    <link rel="icon" href="/assets/favicon.ico" sizes="any" />
     <link rel="stylesheet" href="/assets/styles.css" />
   </head>
   <body>
     <div id="app" v-cloak>
       <header class="topbar">
         <div class="brand-lockup">
-          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <img class="brand-mark" src="/assets/favicon.ico" alt="PLLM" />
           <div>
-            <h1>PLLM <strong>HiberFlow-EER</strong></h1>
+            <h1>PLLM <strong>HiberFlow</strong></h1>
             <p>Foreground-aware elastic MoE inference</p>
           </div>
         </div>
@@ -25,10 +26,6 @@
         </div>
 
         <div class="header-actions">
-          <div class="live-switch" role="group" aria-label="数据模式">
-            <button :class="{ active: !judgeMode }" @click="setJudgeMode(false)">实时</button>
-            <button :class="{ active: judgeMode }" @click="setJudgeMode(true)">评委模式</button>
-          </div>
           <button class="icon-button" title="刷新能力探测" @click="loadCapabilities(true)">
             <i data-lucide="refresh-cw"></i>
           </button>
@@ -43,17 +40,14 @@
             <p>{{ activeStatus.reason || '系统正在评估前台 QoS、释放收益与恢复成本。' }}</p>
           </div>
           <div class="command-actions">
-            <button class="action secondary" @click="runAction('yield')" :disabled="busy || (!backendAvailable && !judgeMode)">
+            <button class="action secondary" @click="runAction('yield')" :disabled="busy || !backendAvailable">
               <i data-lucide="pause"></i><span>微暂停</span>
             </button>
-            <button class="action danger" @click="runAction('hibernate')" :disabled="busy || (!backendAvailable && !judgeMode)">
+            <button class="action danger" @click="runAction('hibernate')" :disabled="busy || !backendAvailable">
               <i data-lucide="snowflake"></i><span>释放资源</span>
             </button>
-            <button class="action primary" @click="runAction('wake')" :disabled="busy || (!backendAvailable && !judgeMode)">
+            <button class="action primary" @click="runAction('wake')" :disabled="busy || !backendAvailable">
               <i data-lucide="play"></i><span>恢复推理</span>
-            </button>
-            <button v-if="judgeMode" class="action judge" @click="playJudgeDemo" :disabled="demoPlaying">
-              <i data-lucide="presentation"></i><span>{{ demoPlaying ? '演示进行中' : '运行演示' }}</span>
             </button>
           </div>
         </section>
@@ -173,7 +167,6 @@
                 <g class="grid-lines"><line v-for="y in [20,70,120,170]" :key="y" x1="0" :y1="y" x2="720" :y2="y" /></g>
                 <polyline class="line gpu" :points="linePoints('gpu')" />
                 <polyline class="line memory" :points="linePoints('memory')" />
-                <line v-if="judgeMode" class="event-marker" :x1="eventMarker" y1="0" :x2="eventMarker" y2="220" />
               </svg>
               <div class="chart-key"><span class="gpu-key">GPU</span><span class="memory-key">内存压力</span></div>
             </div>

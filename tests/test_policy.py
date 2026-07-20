@@ -69,6 +69,55 @@ def test_creative_workload_observes_hold_period() -> None:
     assert second.sleep_level == 0
 
 
+def test_foreground_priority_escalates_sustained_creative_yield() -> None:
+    config = PLLMConfig(mode="foreground_priority", creative_hold_seconds=0.5)
+    policy = PolicyEngine(config, model_size_gb=75.0)
+    current = snapshot(
+        gpu_util=60,
+        foreground=ForegroundApp(
+            pid=99, app_id="blender.desktop", wm_class="Blender", available=True
+        ),
+        processes=[ProcessGpuUsage(pid=99, sm_util=60)],
+    )
+
+    assert policy.evaluate(
+        current, [service()], ControllerState.ACTIVE, now=10.0
+    ).action == "none"
+    yielded = policy.evaluate(
+        current, [service()], ControllerState.ACTIVE, now=10.6
+    )
+    hibernated = policy.evaluate(
+        current, [service()], ControllerState.YIELDING, now=11.1
+    )
+
+    assert yielded.action == "yield"
+    assert hibernated.action == "hibernate"
+    assert hibernated.sleep_level == 1
+    assert "foreground-priority" in hibernated.reason
+
+
+def test_saturated_creative_workload_discards_instead_of_copying_weights() -> None:
+    config = PLLMConfig(mode="foreground_priority", creative_hold_seconds=0.5)
+    policy = PolicyEngine(config, model_size_gb=75.0)
+    current = snapshot(
+        gpu_util=99,
+        foreground=ForegroundApp(
+            pid=99, app_id="blender.desktop", wm_class="Blender", available=True
+        ),
+        processes=[ProcessGpuUsage(pid=99, sm_util=99)],
+    )
+
+    assert policy.evaluate(
+        current, [service()], ControllerState.ACTIVE, now=10.0
+    ).action == "none"
+    hibernated = policy.evaluate(
+        current, [service()], ControllerState.ACTIVE, now=10.6
+    )
+
+    assert hibernated.action == "hibernate"
+    assert hibernated.sleep_level == 2
+
+
 def test_uma_always_uses_deep_sleep() -> None:
     policy = PolicyEngine(PLLMConfig(), model_size_gb=75.0)
     current = snapshot(

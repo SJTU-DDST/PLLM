@@ -7,7 +7,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QByteArray, QPoint, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -67,6 +67,12 @@ MODE_OPTIONS = [
     ("前台优先", "foreground_priority"),
     ("保持休眠", "keep_sleeping"),
 ]
+
+RESOURCE_SERIES = (
+    ("vllm", "vLLM", "#42d392"),
+    ("blender", "Blender", "#ffb454"),
+    ("other", "其他进程", "#61a8ff"),
+)
 
 
 class ApiClient(QWidget):
@@ -139,36 +145,96 @@ class ApiClient(QWidget):
             reply.deleteLater()
 
 
-class Sparkline(QWidget):
-    def __init__(self) -> None:
+class MultiSeriesSparkline(QWidget):
+    def __init__(self, maximum: float = 100.0) -> None:
         super().__init__()
-        self.values: deque[float] = deque([0.0] * 60, maxlen=60)
-        self.setFixedHeight(54)
+        self.maximum = max(1.0, float(maximum))
+        self.values = {
+            key: deque([0.0] * 60, maxlen=60)
+            for key, _label, _color in RESOURCE_SERIES
+        }
+        self.setFixedHeight(42)
 
-    def add_value(self, value: float) -> None:
-        self.values.append(max(0.0, min(100.0, value)))
+    def add_values(self, values: dict[str, float], maximum: float | None = None) -> None:
+        if maximum is not None:
+            self.maximum = max(1.0, float(maximum))
+        for key in self.values:
+            value = float(values.get(key, 0.0))
+            self.values[key].append(max(0.0, min(self.maximum, value)))
         self.update()
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        area = QRectF(0, 4, self.width(), self.height() - 8)
+        area = QRectF(0, 3, self.width(), self.height() - 6)
         painter.fillRect(area, QColor("#151b20"))
-        if len(self.values) < 2:
-            return
-        path = QPainterPath()
-        width_step = area.width() / (len(self.values) - 1)
-        for index, value in enumerate(self.values):
-            point = QPoint(
-                int(area.left() + index * width_step),
-                int(area.bottom() - (value / 100.0) * area.height()),
-            )
-            if index == 0:
-                path.moveTo(point)
-            else:
-                path.lineTo(point)
-        painter.setPen(QPen(QColor("#42d392"), 2))
-        painter.drawPath(path)
+        painter.setPen(QPen(QColor("#2d383e"), 1, Qt.PenStyle.DashLine))
+        for ratio in (0.25, 0.5, 0.75):
+            y = area.bottom() - ratio * area.height()
+            painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
+        for key, _label, color in RESOURCE_SERIES:
+            history = self.values[key]
+            if len(history) < 2:
+                continue
+            path = QPainterPath()
+            width_step = area.width() / (len(history) - 1)
+            for index, value in enumerate(history):
+                point = QPointF(
+                    area.left() + index * width_step,
+                    area.bottom() - (value / self.maximum) * area.height(),
+                )
+                if index == 0:
+                    path.moveTo(point)
+                else:
+                    path.lineTo(point)
+            painter.setPen(QPen(QColor(color), 2))
+            painter.drawPath(path)
+
+
+def process_resource_breakdown(status: dict[str, Any]) -> dict[str, dict[str, float]]:
+    result = {
+        key: {"compute": 0.0, "memory_gb": 0.0}
+        for key, _label, _color in RESOURCE_SERIES
+    }
+    services = status.get("services") or []
+    vllm_pids: set[int] = set()
+    for service in services:
+        pid = int(service.get("pid") or 0)
+        if pid > 0:
+            vllm_pids.add(pid)
+        vllm_pids.update(
+            int(item) for item in service.get("related_pids") or [] if int(item) > 0
+        )
+
+    sensor = status.get("sensor") or {}
+    foreground = sensor.get("foreground") or {}
+    foreground_pid = int(foreground.get("pid") or 0)
+    foreground_text = " ".join(
+        str(foreground.get(key) or "") for key in ("app_id", "title", "wm_class")
+    ).lower()
+    for process in sensor.get("processes") or []:
+        pid = int(process.get("pid") or 0)
+        name = str(process.get("name") or "").lower()
+        if pid in vllm_pids or "vllm" in name:
+            category = "vllm"
+        elif "blender" in name or (pid == foreground_pid and "blender" in foreground_text):
+            category = "blender"
+        else:
+            category = "other"
+        result[category]["compute"] += max(0.0, float(process.get("sm_util") or 0))
+        result[category]["memory_gb"] += max(
+            0.0, float(process.get("memory_gb") or 0)
+        )
+
+    process_compute = sum(item["compute"] for item in result.values())
+    total_compute = max(0.0, float(sensor.get("gpu_util") or 0))
+    result["other"]["compute"] += max(0.0, total_compute - process_compute)
+    process_memory = sum(item["memory_gb"] for item in result.values())
+    total_memory = max(0.0, float(sensor.get("gpu_memory_used_gb") or 0))
+    result["other"]["memory_gb"] += max(0.0, total_memory - process_memory)
+    for item in result.values():
+        item["compute"] = min(100.0, item["compute"])
+    return result
 
 
 class OverlayWindow(QWidget):
@@ -227,12 +293,22 @@ class OverlayWindow(QWidget):
         self.expand_button = QPushButton("展开")
         self.expand_button.setObjectName("quietButton")
         self.expand_button.setFixedWidth(54)
+        self.close_button = QPushButton()
+        self.close_button.setObjectName("closeButton")
+        self.close_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarCloseButton)
+        )
+        self.close_button.setFixedSize(26, 26)
+        self.close_button.setToolTip("关闭 PLLM")
+        self.close_button.setAccessibleName("关闭 PLLM")
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         header.addWidget(self.brand)
         header.addSpacing(8)
         header.addWidget(self.state_dot)
         header.addWidget(self.state_label)
         header.addStretch()
         header.addWidget(self.expand_button)
+        header.addWidget(self.close_button)
         layout.addLayout(header)
 
         self.reason_label = QLabel("等待守护进程状态")
@@ -260,6 +336,53 @@ class OverlayWindow(QWidget):
         metrics.addWidget(self.power_label, 1, 0)
         metrics.addWidget(self.foreground_label, 1, 1)
         layout.addLayout(metrics)
+
+        resource_panel = QFrame()
+        resource_panel.setObjectName("resourcePanel")
+        resource_layout = QVBoxLayout(resource_panel)
+        resource_layout.setContentsMargins(10, 8, 10, 8)
+        resource_layout.setSpacing(5)
+        resource_layout.addWidget(_section_label("进程资源占用"))
+        resource_grid = QGridLayout()
+        resource_grid.setHorizontalSpacing(7)
+        resource_grid.setVerticalSpacing(2)
+        self.resource_labels: dict[str, QLabel] = {}
+        for row, (key, name, color) in enumerate(RESOURCE_SERIES):
+            swatch = QFrame()
+            swatch.setFixedSize(12, 3)
+            swatch.setStyleSheet(f"background: {color}; border: none;")
+            name_label = QLabel(name)
+            name_label.setObjectName("resourceName")
+            value_label = QLabel("计算 --  ·  显存 --")
+            value_label.setObjectName("resourceValue")
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+            self.resource_labels[key] = value_label
+            resource_grid.addWidget(swatch, row, 0)
+            resource_grid.addWidget(name_label, row, 1)
+            resource_grid.addWidget(value_label, row, 2)
+        resource_grid.setColumnStretch(2, 1)
+        resource_layout.addLayout(resource_grid)
+
+        compute_header = QHBoxLayout()
+        compute_header.addWidget(_section_label("计算占用"))
+        compute_header.addStretch()
+        self.compute_total_label = QLabel("GPU --")
+        self.compute_total_label.setObjectName("chartValue")
+        compute_header.addWidget(self.compute_total_label)
+        resource_layout.addLayout(compute_header)
+        self.compute_chart = MultiSeriesSparkline(100.0)
+        resource_layout.addWidget(self.compute_chart)
+
+        memory_header = QHBoxLayout()
+        memory_header.addWidget(_section_label("显存占用"))
+        memory_header.addStretch()
+        self.memory_total_label = QLabel("-- / -- GiB")
+        self.memory_total_label.setObjectName("chartValue")
+        memory_header.addWidget(self.memory_total_label)
+        resource_layout.addLayout(memory_header)
+        self.memory_chart = MultiSeriesSparkline(1.0)
+        resource_layout.addWidget(self.memory_chart)
+        layout.addWidget(resource_panel)
 
         controls = QHBoxLayout()
         self.release_button = QPushButton("立即释放")
@@ -297,9 +420,6 @@ class OverlayWindow(QWidget):
         detail_layout.addWidget(self.expert_label)
         detail_layout.addWidget(self.state_island_label)
 
-        self.sparkline = Sparkline()
-        detail_layout.addWidget(self.sparkline)
-
         detail_layout.addWidget(_section_label("事件记录"))
         self.event_list = QListWidget()
         self.event_list.setFixedHeight(106)
@@ -324,6 +444,7 @@ class OverlayWindow(QWidget):
         self.api.replays_received.connect(self.update_replays)
         self.api.request_failed.connect(self.show_offline)
         self.expand_button.clicked.connect(lambda: self._set_expanded(not self.expanded))
+        self.close_button.clicked.connect(self._quit_application)
         self.release_button.clicked.connect(lambda: self.api.action("hibernate"))
         self.wake_button.clicked.connect(lambda: self.api.action("wake"))
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
@@ -382,6 +503,29 @@ class OverlayWindow(QWidget):
         foreground = sensor.get("foreground") or {}
         app = foreground.get("app_id") or foreground.get("wm_class") or "未识别"
         self.foreground_label.setText(f"前台  {str(app)[:18]}")
+        resources = process_resource_breakdown(status)
+        for key, _name, _color in RESOURCE_SERIES:
+            values = resources[key]
+            self.resource_labels[key].setText(
+                f"计算 {values['compute']:.0f}%  ·  显存 {values['memory_gb']:.1f} GiB"
+            )
+        self.compute_total_label.setText(f"GPU {gpu_util:.0f}%")
+        self.compute_chart.add_values(
+            {key: resources[key]["compute"] for key, _name, _color in RESOURCE_SERIES}
+        )
+        memory_maximum = float(total) if isinstance(total, (int, float)) else 1.0
+        self.memory_total_label.setText(
+            f"{float(used):.1f} / {memory_maximum:.0f} GiB"
+            if isinstance(used, (int, float)) and isinstance(total, (int, float))
+            else "-- / -- GiB"
+        )
+        self.memory_chart.add_values(
+            {
+                key: resources[key]["memory_gb"]
+                for key, _name, _color in RESOURCE_SERIES
+            },
+            maximum=memory_maximum,
+        )
         services = status.get("services") or []
         controllable = sum(1 for item in services if item.get("controllable"))
         self.service_label.setText(f"vLLM  {controllable}/{len(services)} 可控制")
@@ -427,7 +571,6 @@ class OverlayWindow(QWidget):
         self.state_island_label.setText(
             f"KV/Mamba 状态小岛  {island_text} · {guard_text}"
         )
-        self.sparkline.add_value(gpu_util)
         self.release_button.setEnabled(
             state in {"active", "elastic_resident", "yielding"}
             and controllable > 0
@@ -476,13 +619,39 @@ class OverlayWindow(QWidget):
                 "reason": "DEMO SCENARIO: 11 high-locality layers use 384 slots",
                 "last_action_duration_ms": None,
                 "reclaimed_gb": 1.8,
-                "services": [{"controllable": True}],
+                "services": [
+                    {
+                        "controllable": True,
+                        "pid": 301,
+                        "related_pids": [301, 302],
+                    }
+                ],
                 "sensor": {
                     "gpu_util": 22,
                     "gpu_memory_used_gb": 13.4,
                     "gpu_memory_total_gb": 97.9,
                     "power_watts": 126,
-                    "foreground": {"app_id": "Blender"},
+                    "foreground": {"pid": 401, "app_id": "Blender"},
+                    "processes": [
+                        {
+                            "pid": 302,
+                            "name": "VLLM::EngineCore",
+                            "memory_gb": 8.7,
+                            "sm_util": 7,
+                        },
+                        {
+                            "pid": 401,
+                            "name": "blender",
+                            "memory_gb": 3.6,
+                            "sm_util": 13,
+                        },
+                        {
+                            "pid": 501,
+                            "name": "other-cuda",
+                            "memory_gb": 0.8,
+                            "sm_util": 2,
+                        },
+                    ],
                 },
                 "expert_residency": {
                     "decode_plan": {
@@ -531,6 +700,18 @@ class OverlayWindow(QWidget):
                 }
             ]
         )
+        for step in range(40):
+            self.compute_chart.add_values(
+                {
+                    "vllm": 6.0 + (step % 7),
+                    "blender": 10.0 + ((step * 3) % 13),
+                    "other": 1.0 + (step % 3),
+                }
+            )
+            self.memory_chart.add_values(
+                {"vllm": 8.7, "blender": 3.2 + (step % 5) * 0.1, "other": 1.1},
+                maximum=97.9,
+            )
 
     def _mode_changed(self, _index: int) -> None:
         if not self._updating_mode:
@@ -547,11 +728,19 @@ class OverlayWindow(QWidget):
             self.api.get_events()
             self.api.get_replays()
 
+    def _quit_application(self) -> None:
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.hide()
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
+
     def _set_expanded(self, expanded: bool) -> None:
         self.expanded = expanded
         self.details.setVisible(expanded)
         self.expand_button.setText("收起" if expanded else "展开")
-        self.setFixedHeight(590 if expanded else 230)
+        self.setFixedHeight(830 if expanded else 510)
 
     def _position_window(self) -> None:
         screen = QApplication.primaryScreen()
@@ -585,11 +774,18 @@ class OverlayWindow(QWidget):
             QLabel#metric { color: #d5dde0; padding: 2px 0; }
             QLabel#sectionLabel { color: #8fa0a8; font-size: 11px; font-weight: 600; }
             QLabel#sectionValue { color: #c9d3d7; font-size: 12px; }
+            QLabel#resourceName { color: #c9d3d7; font-size: 12px; font-weight: 600; }
+            QLabel#resourceValue { color: #dce4e7; font-size: 12px; }
+            QLabel#chartValue { color: #aebbc1; font-size: 11px; }
+            QFrame#resourcePanel { background: #192126; border: 1px solid #354047; border-radius: 5px; }
             QPushButton { min-height: 30px; border-radius: 5px; padding: 0 11px; font-weight: 600; }
             QPushButton#primaryButton { background: #35b978; color: #07150f; border: 1px solid #47cc8b; }
             QPushButton#primaryButton:hover { background: #45ca89; }
             QPushButton#secondaryButton { background: #35414a; color: #e8edef; border: 1px solid #50606a; }
             QPushButton#quietButton { min-height: 25px; background: transparent; color: #9faeb5; border: 1px solid #46535b; padding: 0 8px; }
+            QPushButton#closeButton { min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 4px; }
+            QPushButton#closeButton:hover { background: #b94a52; border-color: #d16068; }
+            QPushButton#closeButton:pressed { background: #8f343b; }
             QPushButton:disabled { background: #293137; color: #637078; border-color: #394249; }
             QComboBox { min-height: 30px; background: #151b20; color: #e3e9eb; border: 1px solid #46545d; border-radius: 5px; padding: 0 8px; }
             QComboBox QAbstractItemView { background: #20272c; color: #edf1f3; selection-background-color: #355d4a; }

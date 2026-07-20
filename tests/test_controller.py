@@ -234,6 +234,48 @@ def test_new_prefill_expands_an_elastic_runtime_before_forwarding(
     ]
 
 
+def test_new_prefill_uses_exact_elastic_loading_without_physical_expansion(
+    tmp_path: Path,
+) -> None:
+    controller = PLLMController(
+        PLLMConfig(
+            model_path=str(tmp_path / "missing-model"),
+            hibercache_dir=str(tmp_path / "cache"),
+            expert_runtime_socket=str(tmp_path / "pllm-eer.sock"),
+        ),
+        Storage(tmp_path / "events.sqlite3"),
+        monitor=FakeMonitor(),
+        manager=FakeManager(),
+    )
+
+    class ElasticPrefillRuntime(FakeExpertRuntime):
+        def status(self):
+            return {
+                "online": True,
+                "data_plane_ready": True,
+                "elastic_prefill": {
+                    "enabled": True,
+                    "exact_route_load": True,
+                    "max_unique_experts_per_layer": 380,
+                },
+                "data_plane": {
+                    "layers": [
+                        {"slot_count": 380, "global_experts": 512}
+                    ]
+                },
+            }
+
+    runtime = ElasticPrefillRuntime()
+    controller.expert_runtime = runtime
+    actions = []
+    controller.expert_dataplane_action = actions.append
+
+    controller.prepare_inference_request("request-new")
+
+    assert runtime.calls == [("prefill", True)]
+    assert actions == []
+
+
 def test_phase_eer_rejects_overlapping_proxy_requests(tmp_path: Path) -> None:
     controller = PLLMController(
         PLLMConfig(

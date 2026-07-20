@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pllm.api import create_app
@@ -155,7 +156,7 @@ def test_phase_eer_rejects_multi_sequence_requests(
     )
 
     assert response.status_code == 503
-    assert "full prefill residency" in response.json["error"]["message"]
+    assert "exact expert residency" in response.json["error"]["message"]
 
 
 def test_control_action_endpoint(mock_vllm_url: str, tmp_path: Path) -> None:
@@ -178,15 +179,58 @@ def test_dashboard_and_extended_control_endpoints(
     client = app.test_client()
 
     dashboard = client.get("/")
+    favicon = client.get("/assets/favicon.ico")
     capabilities = client.get("/api/v1/capabilities?refresh=1")
     compiled = client.post(
         "/api/v1/policy/compile", json={"text": "Blender 时释放", "apply": False}
     )
 
     assert dashboard.status_code == 200
-    assert b"PLLM HiberFlow-EER" in dashboard.data
+    assert b"PLLM HiberFlow" in dashboard.data
+    assert "评委模式" not in dashboard.get_data(as_text=True)
+    assert favicon.status_code == 200
+    assert favicon.mimetype == "image/vnd.microsoft.icon"
     assert capabilities.json["refresh"] is True
     assert compiled.json["input"] == "Blender 时释放"
+
+
+def test_status_and_telemetry_emit_browser_safe_json(
+    mock_vllm_url: str, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "events.sqlite3")
+    controller = FakeController(mock_vllm_url)
+    controller.status = lambda: {
+        "state": "active",
+        "sensor": {"gpu_util": 12, "gpu_memory_used_gb": 4.0},
+        "risk": {
+            "mean": float("inf"),
+            "minimum": float("-inf"),
+            "invalid": float("nan"),
+        },
+    }
+    app = create_app(controller, storage)
+    client = app.test_client()
+
+    response = client.get("/api/v1/status")
+    text = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "Infinity" not in text
+    assert "NaN" not in text
+    assert response.json["sensor"]["gpu_util"] == 12
+    assert response.json["risk"] == {
+        "invalid": None,
+        "mean": None,
+        "minimum": None,
+    }
+
+    stream = client.get("/api/v1/telemetry/stream?interval=5", buffered=False)
+    first_event = next(stream.response).decode("utf-8")
+    stream.close()
+    payload = json.loads(first_event.split("data: ", 1)[1])
+
+    assert payload["sensor"]["gpu_memory_used_gb"] == 4.0
+    assert payload["risk"]["mean"] is None
 
 
 def test_expert_residency_endpoints_are_explicitly_non_executable(

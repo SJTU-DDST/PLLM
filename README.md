@@ -1,6 +1,6 @@
-# PLLM HiberFlow-EER
+# PLLM HiberFlow
 
-PLLM HiberFlow-EER 是面向 DGX Spark 与 NVIDIA 桌面 AI 工作站的前台感知 vLLM 资源运行时。它在 Blender、游戏、视频编码或系统内存压力出现时，按前台资源包络在完整驻留、精确的弹性专家驻留、微暂停和事务式深度休眠间选择。
+PLLM HiberFlow 是面向 DGX Spark 与 NVIDIA 桌面 AI 工作站的前台感知 vLLM 资源运行时。它在 Blender、游戏、视频编码或系统内存压力出现时，按前台资源包络在完整驻留、精确的弹性专家驻留、微暂停和事务式深度休眠间选择。
 
 第一版只控制 vLLM。PLLM 不暂停或终止训练任务、未知 CUDA 进程，也不会控制未开放 Sleep API 的外部服务。
 

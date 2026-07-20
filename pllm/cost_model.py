@@ -106,11 +106,18 @@ class ForegroundCostModel:
             )
         return CostPlan(
             action="hibernate",
-            level=2 if snapshot.uma or workload in {
-                WorkloadClass.MEMORY_PRESSURE,
-                WorkloadClass.POWER_PRESSURE,
-                WorkloadClass.GAME,
-            } else self._discrete_level(snapshot),
+            level=(
+                2
+                if snapshot.uma
+                or workload
+                in {
+                    WorkloadClass.MEMORY_PRESSURE,
+                    WorkloadClass.POWER_PRESSURE,
+                    WorkloadClass.GAME,
+                }
+                or (workload == WorkloadClass.CREATIVE and pressure >= 0.9)
+                else self._discrete_level(snapshot)
+            ),
             score=hibernate_score,
             costs=costs,
             reason=f"resource hibernation selected: {reason}",

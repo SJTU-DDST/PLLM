@@ -249,7 +249,10 @@ def is_standalone_vllm_command(
 def _listening_urls(process: psutil.Process) -> list[str]:
     urls = []
     try:
-        connections = process.net_connections(kind="inet")
+        connection_reader = getattr(process, "net_connections", None)
+        if connection_reader is None:
+            connection_reader = process.connections
+        connections = connection_reader(kind="inet")
     except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
         return urls
     for connection in connections:

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import threading
 import time
+from types import SimpleNamespace
 
+import psutil
 import requests
 
-from pllm.vllm import VLLMClient, is_standalone_vllm_command
+from pllm.vllm import VLLMClient, _listening_urls, is_standalone_vllm_command
 
 
 def test_probe_and_level_one_round_trip(mock_vllm_url: str) -> None:
@@ -106,3 +108,17 @@ def test_training_commands_are_not_standalone_vllm() -> None:
         "python train_grpo.py --use-vllm vllm serve", excluded
     )
     assert not is_standalone_vllm_command("python train.py --vllm-util 0.2", excluded)
+
+
+def test_listening_urls_supports_legacy_psutil_process_api() -> None:
+    class LegacyProcess:
+        def connections(self, kind: str):
+            assert kind == "inet"
+            return [
+                SimpleNamespace(
+                    status=psutil.CONN_LISTEN,
+                    laddr=SimpleNamespace(ip="127.0.0.1", port=8000),
+                )
+            ]
+
+    assert _listening_urls(LegacyProcess()) == ["http://127.0.0.1:8000"]

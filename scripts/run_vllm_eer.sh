@@ -43,6 +43,17 @@ fi
 export PLLM_VLLM_MAX_BATCHED_TOKENS
 export PLLM_VLLM_ENABLE_SLEEP_MODE="${PLLM_VLLM_ENABLE_SLEEP_MODE:-0}"
 export PLLM_VLLM_ENABLE_HIBERCACHE="${PLLM_VLLM_ENABLE_HIBERCACHE:-0}"
+if [[ "${PLLM_VLLM_ENABLE_HIBERCACHE}" == "1" ]]; then
+  for argument in "$@"; do
+    if [[ "${argument}" == "--enable-return-routed-experts" \
+      || "${argument}" == --enable-return-routed-experts=* ]]; then
+      echo "vLLM 0.25.1 does not allow routed-expert returns with a KV connector." >&2
+      echo "Blender demo: omit --enable-return-routed-experts and keep HiberCache enabled." >&2
+      echo "Route tracing: set PLLM_VLLM_ENABLE_HIBERCACHE=0 before using the flag." >&2
+      exit 2
+    fi
+  done
+fi
 export PLLM_EER_CACHE_QUOTA_GIB="${PLLM_EER_CACHE_QUOTA_GIB:-80}"
 export PLLM_EER_RDMA_PORT="${PLLM_EER_RDMA_PORT:-17900}"
 export PLLM_EER_RDMA_BINARY="${PLLM_EER_RDMA_BINARY:-${ROOT}/rdma_bridge/build/pllm-rdma-store}"

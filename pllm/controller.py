@@ -375,7 +375,7 @@ class PLLMController:
         minimum_decode_tokens: int | None = None,
         sequence_count: int = 1,
     ) -> None:
-        """Restore full expert residency before forwarding a new prefill."""
+        """Admit one prefill with full residency or exact elastic route loading."""
         if sequence_count != 1:
             raise RuntimeError("PhaseEER requires exactly one sequence per request")
         runtime = self.expert_runtime.status()
@@ -403,6 +403,13 @@ class PLLMController:
             < int(layer.get("global_experts", 0))
             for layer in layers
         )
+        elastic_prefill = dict(runtime.get("elastic_prefill") or {})
+        exact_elastic_prefill = bool(
+            non_full
+            and elastic_prefill.get("enabled")
+            and elastic_prefill.get("exact_route_load")
+            and int(elastic_prefill.get("max_unique_experts_per_layer", 0)) >= 22
+        )
         with self._status_lock:
             active = dict(self._inference_phases)
         if active:
@@ -422,7 +429,7 @@ class PLLMController:
                     minimum_decode_tokens
                 )
         self.mark_inference_phase("prefill", reset_decode=True, request_id=request_id)
-        if full_slots > 0 and non_full:
+        if full_slots > 0 and non_full and not exact_elastic_prefill:
             self.expert_dataplane_action(
                 {
                     "action": "resize",

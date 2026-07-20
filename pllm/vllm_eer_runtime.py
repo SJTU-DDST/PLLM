@@ -124,12 +124,16 @@ def cache_storage_signature(
     if sample_content:
         for key in sorted(representatives):
             tensor = representatives[key].detach()
-            if not tensor.is_contiguous():
-                raise RuntimeError("state-island sampling requires contiguous cache tensors")
-            raw = tensor.view(torch.uint8).reshape(-1)
-            length = int(raw.numel())
+            storage = tensor.untyped_storage()
+            length = int(storage.nbytes())
             if length <= 0:
                 continue
+            # Cache tensors may be non-contiguous views into a shared allocation.
+            # Sample the allocation itself so this guard neither rejects those views
+            # nor materializes a multi-GiB contiguous copy on the critical path.
+            raw = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+                storage, 0, (length,), (1,)
+            )
             width = min(sample_bytes, length)
             offsets = sorted({0, max(0, (length - width) // 2), length - width})
             content.update(f"{key[0]}:{key[1]}:{length}".encode())
@@ -521,6 +525,7 @@ class EERRuntime:
         self._control_thread: threading.Thread | None = None
         self._loader_cache_released = False
         self._model_runner: Any | None = None
+        self._startup_profile_pending = True
         self._last_state_island_guard: dict[str, Any] = {
             "checked": False,
             "preserved": None,
@@ -528,6 +533,9 @@ class EERRuntime:
 
     def bind_model_runner(self, model_runner: Any) -> None:
         self._model_runner = model_runner
+
+    def finish_startup_profile(self) -> None:
+        self._startup_profile_pending = False
 
     def state_island_status(self, *, sample_content: bool = False) -> dict[str, Any]:
         if self._model_runner is None:
@@ -608,11 +616,16 @@ class EERRuntime:
         layer_id = _layer_id(layer)
         phase = self.route_window.current_phase()
         fully_resident = self.data_plane.is_fully_resident(layer_id)
+        startup_profile = self._startup_profile_pending and phase == "idle"
         if fully_resident and phase != "decode":
             return
-        if not fully_resident and phase != "decode":
+        if (
+            not fully_resident
+            and phase not in {"prefill", "decode"}
+            and not startup_profile
+        ):
             raise RuntimeError(
-                "a non-full expert profile may execute only in decode; "
+                "a non-full expert profile may execute only in prefill or decode; "
                 "new prefill must be admitted through the PLLM proxy"
             )
         detached = topk_ids.detach()
@@ -621,14 +634,17 @@ class EERRuntime:
         else:
             detached = detached.reshape(-1, detached.shape[-1])
         rows = detached.cpu().tolist()
-        self.route_window.observe_rows(layer_id, rows)
+        if not startup_profile:
+            self.route_window.observe_rows(layer_id, rows)
         experts = list(
             dict.fromkeys(
                 int(item) for row in rows for item in row if int(item) >= 0
             )
         )
-        pinned = self.route_window.recent_experts(
-            layer_id, self.pin_recent_steps
+        pinned = (
+            self.route_window.recent_experts(layer_id, self.pin_recent_steps)
+            if phase == "decode" and not startup_profile
+            else []
         )
         if fully_resident:
             return
@@ -640,7 +656,8 @@ class EERRuntime:
             pinned_experts=pinned,
         )
         load_ms = (time.perf_counter() - load_started) * 1000.0
-        self._record_miss_load(layer_id, len(rows), load_ms)
+        if phase == "decode" and not startup_profile:
+            self._record_miss_load(layer_id, len(rows), load_ms)
 
     def _record_miss_load(
         self, layer_id: int, token_rows: int, load_ms: float
@@ -875,8 +892,22 @@ class EERRuntime:
         raise ValueError(f"unknown EER command: {command}")
 
     def status(self) -> dict[str, Any]:
-        data_plane = self.data_plane.status()
-        layers_ready = len(data_plane.get("layers", [])) == self.expected_layers
+        initialized_layers = self.data_plane.layers()
+        initializing = len(initialized_layers) < self.expected_layers
+        data_plane = (
+            {
+                "backend": "exact_expert_slot_dataplane",
+                "data_plane_ready": False,
+                "exact_route_required": True,
+                "layers": [],
+                "initializing": True,
+                "initialized_layers": len(initialized_layers),
+                "expected_layers": self.expected_layers,
+            }
+            if initializing
+            else self.data_plane.status()
+        )
+        layers_ready = not initializing
         data_plane["data_plane_ready"] = bool(
             data_plane.get("data_plane_ready")
             and layers_ready
@@ -925,6 +956,19 @@ class EERRuntime:
                 if len(physical_slots) == 1
                 else min(physical_slots, default=self.config.slots_per_layer)
             ),
+            "elastic_prefill": {
+                "enabled": self.config.mode == "elastic",
+                "exact_route_load": True,
+                "max_unique_experts_per_layer": min(
+                    active_slots, default=self.config.slots_per_layer
+                ),
+                "top_k": 22,
+                "max_token_rows_without_route_overlap": min(
+                    active_slots, default=self.config.slots_per_layer
+                )
+                // 22,
+                "evidence": "runtime_actual_topk_before_marlin_dispatch",
+            },
             "cache": self.local_store.status(),
             "rdma": {
                 "enabled": bool(self.config.rdma_peer),
@@ -953,7 +997,9 @@ class EERRuntime:
             "uptime_seconds": round(time.time() - self.started_at, 3),
             "last_error": self.last_error,
             "data_plane": data_plane,
-            "route_trace": self.route_window.status(),
+            "route_trace": self.route_window.status(
+                profiles=() if initializing else self.route_window.validation_profiles
+            ),
             "miss_debt": self._miss_debt_status(),
             "recent_pin_steps": self.pin_recent_steps,
             "state_island": self.state_island_status(),
@@ -1067,6 +1113,11 @@ class _ControlHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
             line = self.rfile.readline(1024 * 1024)
+        except ConnectionError:
+            return
+        if not line:
+            return
+        try:
             request = json.loads(line)
             if not isinstance(request, dict):
                 raise ValueError("request must be a JSON object")
@@ -1074,7 +1125,12 @@ class _ControlHandler(socketserver.StreamRequestHandler):
         except Exception as exc:
             self.server.runtime.last_error = str(exc)
             response = {"ok": False, "error": str(exc)}
-        self.wfile.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
+        try:
+            self.wfile.write(
+                json.dumps(response, separators=(",", ":")).encode() + b"\n"
+            )
+        except ConnectionError:
+            return
 
 
 _RUNTIME: EERRuntime | None = None
@@ -1103,6 +1159,7 @@ def install() -> EERRuntime | None:
     from vllm.model_executor.model_loader import ep_weight_filter
     from vllm.model_executor.model_loader import weight_utils
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    from vllm.v1.worker.gpu_worker import Worker as GPUWorker
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     runtime = EERRuntime(config)
@@ -1114,6 +1171,7 @@ def install() -> EERRuntime | None:
     original_init_filter = DefaultModelLoader._init_ep_weight_filter
     original_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
     original_init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales
+    original_compile_or_warm_up = GPUWorker.compile_or_warm_up_model
 
     def create_weights(method, layer, num_experts, *args, **kwargs):
         effective = (
@@ -1192,6 +1250,11 @@ def install() -> EERRuntime | None:
         runtime.bind_model_runner(model_runner)
         return result
 
+    def compile_or_warm_up_model(worker, *args, **kwargs):
+        result = original_compile_or_warm_up(worker, *args, **kwargs)
+        runtime.finish_startup_profile()
+        return result
+
     ep_weight_filter_should_skip = ep_weight_filter.should_skip_weight
 
     ModelOptNvFp4FusedMoE.create_weights = create_weights
@@ -1204,6 +1267,7 @@ def install() -> EERRuntime | None:
     weight_utils.should_skip_weight = should_skip_weight
     GPUModelRunner.initialize_kv_cache = initialize_kv_cache
     GPUModelRunner.init_fp8_kv_scales = init_fp8_kv_scales
+    GPUWorker.compile_or_warm_up_model = compile_or_warm_up_model
     marlin_utils_fp4._nvfp4_compute_scale_factor = (
         low_memory_nvfp4_scale_factor
     )
