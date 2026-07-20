@@ -1,328 +1,252 @@
-# PLLM HiberFlow-EER 项目报告
+# PLLM HiberFlow 项目报告
 
-## 1. 项目定位
+## 1. 项目概述
 
-PLLM 是面向 DGX Spark 和 NVIDIA 桌面 AI 工作站的前台感知 vLLM 资源运行时。它解决的不是“怎样让大模型独占设备跑得更快”，而是：
+PLLM HiberFlow 是面向 DGX Spark 与 NVIDIA Linux 桌面 AI 工作站的前台感知推理运行时。它解决的核心问题是：当大模型推理服务长期驻留 GPU，而用户临时启动 Blender、游戏、视频编码或其他前台任务时，系统如何在不中止未知进程、不改变模型路由正确性的前提下，及时让出算力、显存、统一内存容量和 I/O 带宽，并在前台压力结束后恢复推理服务。
 
-> 当用户突然启动游戏、Blender、视频编码或其他高负载任务时，后台 120B MoE 模型怎样迅速让出容量、带宽、算力和功耗，并在前台结束后低成本恢复同一请求？
+传统云端调度通常假设推理任务拥有稳定的设备配额；桌面工作站的优先级恰好相反，交互用户必须拥有最终资源优先权。PLLM 因此把“前台资源包络”作为一等输入，并把暂停、弹性驻留、状态保存和恢复统一到一个控制面中。
 
-第一版只控制 vLLM，不暂停训练任务、未知 CUDA 进程或未开放 Sleep API 的外部服务。测试模型固定为只读共享目录中的 `NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4`，不复制、不下载。
+第一版只控制明确接入的 vLLM 服务。训练进程、未知 CUDA 进程，以及未公开 Sleep API 的外部服务不在控制范围内。
 
-最新方案由三档连续动作构成：
+## 2. 使用场景
 
-1. **Full Resident**：前台空闲时保持完整模型和正常 token rate。
-2. **Phase-Constrained Expert Residency**：中等压力下 prefill 保持完整模型；仅 decode 根据过去窗口的逐层路由，在下一窗口选择不同的 resident budget，其余 routed experts 位于 NVMe 或远端主机。
-3. **Transactional Hibernation**：压力过大或 expert miss 流量不可承受时，在 token 边界提交 live state，丢弃不可变权重并深度休眠。
+典型演示流程如下：
 
-项目暂不研究动态 Top-k。任何模式都不减少或替换 router 选择的 22 个 experts；预测错误只允许产生等待和额外 I/O，不能改变模型输出。
+1. NVIDIA Nemotron 通过 vLLM 在后台提供 OpenAI 兼容推理。
+2. PLLM 控制中心展示模型、GPU、内存、功耗和专家驻留状态。
+3. 用户切换到 Blender 或启动前台渲染。
+4. Foreground-QoS Agent 识别前台应用与资源压力，先尝试微暂停或安全的弹性收缩；若资源包络仍不可满足，则进入深度休眠。
+5. 前台压力消退后，PLLM 按本地 NVMe、host backup 或远端 warm source 的可用性选择恢复路径。
+6. 请求继续通过 PLLM 代理接入，用户无需手动停止和重启模型服务。
 
-## 2. 用户演示闭环
+同一机制也适用于游戏、视频编解码、交互式 CUDA 应用、内存压力和低电量场景。
 
-正式 Demo 使用一条可观察的因果链：
+## 3. 设计目标与边界
 
-1. Nemotron 正在通过 vLLM 流式生成 CUDA/DOCA 代码。
-2. 用户启动 Blender 或游戏，GNOME focus、进程 exec 和 NVML activity 触发前台资源需求。
-3. 悬浮窗显示需要释放的物理容量、允许的后台算力和决策 deadline。
-4. PLLM 先降低 decode duty cycle，再由 horizon-aware planner 选择逐层 `{K_l}`；UI 展示实际 resident bytes、held-out byte hit、blocking miss、transition cost 和剩余 decode horizon。
-5. 若预计 SSD/RDMA 流量会破坏前台 QoS，系统停止换页，在 token 边界 commit 并进入 Level-2 hibernation。
-6. 前台吞吐、`MemAvailable`、PSI、功耗与 I/O 实时显示，并与无后台模型基线比较。
-7. 前台结束后，系统渐进 warm experts 或从 NVMe/ConnectX-7 恢复完整权重，原请求继续输出。
+### 3.1 设计目标
 
-评委模式必须区分 `LIVE`、`MOCK` 和 `HISTORICAL REPLAY`。没有运行过的真实模型数据不能伪装成实时曲线。
+- 前台任务能够在短时间内获得明确的资源让渡。
+- 后台推理连接、请求记录和恢复过程由统一控制面管理。
+- 每次决策都能解释其输入、代价和选中的动作。
+- MoE 专家预测只影响预取与驱逐，不改变模型实际 Top-k 路由。
+- 本地 NVMe、host memory 与 RDMA 远端缓存共享同一对象和 manifest 语义。
+- 对 DGX Spark 的 UMA、功耗和 RDMA 能力做硬件感知适配。
 
-## 3. 系统架构
+### 3.2 非目标
 
-```text
-GNOME focus/exec ─┐
-NVML/codec/power ─┼─> Foreground-QoS Agent ─> resource envelope R/D/B/C/H
-PSI/MemAvailable ─┤                                  |
-UPower/profile ───┘                                  v
-                                      Full / Elastic / Yield / Hibernate
-                                               |              |
-                                               v              v
-                                  Exact Expert Residency   Token Transaction
-                                  slot cache + predictor   KV + Mamba + ledger
-                                      |          |              |
-                                      v          v              v
-                                  local NVMe  CX-7 host-stage  SparkLoad
-                                               |
-                                               v
-                             Flask API + SQLite + Vue + PySide6
-```
+- 不抢占或终止任意 CUDA 进程。
+- 不把训练作业纳入自动休眠控制。
+- 不在默认配置中向局域网公开控制 API。
+- 不把 host-staged RDMA 声称为 GPUDirect RDMA。
+- 不用预测专家替换真实 router 输出，也不通过动态 Top-k 牺牲质量。
+- 在模型内部状态序列化未接通前，不声称所有混合模型状态已经实现逐 token 精确恢复。
 
-状态机为：
+## 4. 总体架构
 
 ```text
-FULL_RESIDENT <-> ELASTIC_RESIDENT -> YIELDING -> COMMITTING
-                                                   |
-                                                   v
-                                              HIBERNATED
-                                                   |
-                                                   v
-                                               RESTORING
+┌────────────────────── 感知层 ──────────────────────┐
+│ GNOME focus │ NVML │ NVENC/NVDEC │ PSI │ 内存 │ 电源 │
+└────────────────────────┬───────────────────────────┘
+                         v
+              Foreground-QoS Agent
+                         │ workload + resource envelope
+                         v
+             Policy Engine + Cost Model
+                         │
+          ┌──────────────┼──────────────────┐
+          v              v                  v
+     vLLM Sleep     Expert Residency   Storage Planner
+     Level 0/1/2      + Data Plane     SSD / host / RDMA
+          └──────────────┼──────────────────┘
+                         v
+                  PLLM Controller
+                REST / SSE / OpenAI Proxy
+                   │               │
+                   v               v
+             Vue Dashboard    PySide6 Overlay
 ```
 
-## 4. 核心模块
+核心代码按职责拆分：
 
-### 4.1 Foreground-QoS Agent
+- `monitor.py`、`foreground.py`：系统、GPU 与桌面输入。
+- `policy.py`、`cost_model.py`：资源分类、成本比较和动作建议。
+- `controller.py`：状态机、动作互斥、恢复编排和安全边界。
+- `vllm.py`、`pause_resume.py`：vLLM 服务发现与 Sleep API 控制。
+- `hibercache.py`、`hiberstate.py`：活跃状态的分层保存与事务提交。
+- `expert_residency.py`、`decode_residency.py`：专家驻留计划。
+- `expert_dataplane.py`、`vllm_eer_runtime.py`：真实物理槽位和模型内运行时。
+- `expert_store.py`、`rdma_bridge/`：本地及远端对象存储。
+- `api.py`：控制 API、SSE、请求代理与 replay。
 
-Agent 每 250ms 融合：
+## 5. Foreground-QoS Agent
 
-- GNOME Shell D-Bus 的焦点 PID、app ID 和进程启动事件；
-- NVML 的 GPU、进程级 SM、内存、功耗、NVENC/NVDEC；
-- Linux `MemAvailable`、swap、CPU load 和 memory PSI；
-- UPower 与 `powerprofilesctl`；
-- 历史前台持续时间、误触发和恢复成本。
+Agent 以 250 ms 为默认周期采样：
 
-输出不是一个简单阈值，而是前台资源包络：容量 `R`、释放 deadline `D`、可用数据移动带宽 `B`、后台 compute duty cycle `C` 和预计持续时间 `H`。自然语言策略如“Blender 渲染时优先释放 40GB”只能编译成这些受限字段，最后由白名单 policy guard 执行。
+- GNOME 活跃窗口、PID、应用 ID 与窗口类；
+- NVML 进程级 GPU 使用、显存、功耗与温度；
+- NVENC/NVDEC 活动；
+- `/proc/pressure/memory` 与 `MemAvailable`；
+- 电池容量、是否接入电源和系统电源策略；
+- vLLM 当前服务状态与推理阶段。
 
-UMA 与独显使用不同的默认 reserve。128GB Spark 保留原始 system/foreground 预算；96GB RTX 的静态投影为 idle=`full`、GPU pressure=`480`（3.691GiB reclaim）、creative=`448`（7.383GiB）、game=`384`（14.766GiB）、memory pressure=`hibernate`。这些只是进入 route planner 的容量目标，不是实际 GPU 释放量。
+应用模式把 Blender、DaVinci Resolve、OBS、ffmpeg、Steam/Proton 等识别为 creative 或 game workload。训练、DeepSpeed、torchrun 等默认位于排除列表，避免 PLLM 越权控制。
 
-### 4.2 Phase-Constrained Elastic Expert Residency
+策略不是简单阈值触发。控制器为保持推理、微暂停、弹性驻留和深度休眠计算代价，结合前台持续时间、恢复时间、内存下限、显存缺口、I/O 预算和功耗压力选择动作。Web API 同时公开传感器快照和决策原因，便于演示与诊断。
 
-本地 checkpoint 静态分析显示：
-
-- tensor 合计约 74.783GiB；
-- strict `experts.<id>` physical expert objects 约 59.063GiB；
-- Mamba、Attention、shared experts、latent projection、embedding、router 等非 routed 权重约 15.720GiB；
-- 40 个 MoE 层，每层 512 experts，每 token 固定 Top-22；
-- 平均 layer-local expert object 为 2.953MiB。
-
-每层保留 64 个 slots 时，理论 routed cache 为 7.383GiB，总权重工作集约 23.103GiB；每层 128 slots 时约 30.486GiB。对应 projection reclaim 为 51.680GiB 和 44.297GiB，但不是已经测得的运行时结果。
-
-当前 predictor 使用过去 256 个逐 token Top-22 rows 形成下一窗口的 expert ranking。统计只在下一完整窗口上计分，避免同窗 coverage 泄漏；每层保留独立 held-out miss distribution。actual router 始终权威：
+## 6. 分级状态机
 
 ```text
-predict -> async prefetch -> actual Top-22 route
-                         -> hit: remap logical id to physical slot
-                         -> miss: load exact expert and stall
+ACTIVE <-> ELASTIC_RESIDENT -> YIELDING -> QUIESCING
+                                      -> HIBERNATED -> RESTORING -> ACTIVE
 ```
 
-系统不使用错误 expert，不修改 Top-k，不做 cache-aware rerouting。规划器在 `K_l in {256,320,384,448,480,496,504,512}` 中联合选择各层容量，把 held-out worst-observed miss surrogate、批量 RDMA、GPU compaction、当前 profile 到目标 profile、未来 full-prefill expansion、kernel rebuild 与剩余 decode token 全部摊销到 `<5x` TPOT SLO。剩余 horizon 只来自显式 `min_tokens` 减去 vLLM 返回的精确 delta token IDs；`max_tokens`、文本 chunk 或跨 request 拼接都不能作为摊销证据。每个 16MiB bucket 保存非支配 frontier，小规模实例与 exhaustive oracle 对照。40 层 synthetic solve p50 约 2.295s，因此求解在后台线程进行，前台先以约 1.53ms dispatch Level-0 yield。当前风险模型不是统计置信保证；数据不足、domain shift、并发 decode 或短 horizon 时退出 elastic mode。
+- **ACTIVE**：完整模型可服务。
+- **ELASTIC_RESIDENT**：decode 阶段维护受约束的专家工作集。
+- **YIELDING**：vLLM Level 0 暂停 scheduler；连接保持，GPU cache 不释放。
+- **QUIESCING**：阻止新工作并等待连接器进入可提交边界。
+- **HIBERNATED**：Level 1 保留 host 权重备份，或 Level 2 丢弃权重并保留恢复信息。
+- **RESTORING**：恢复权重、连接器与调度器，然后开放新请求。
 
-动态 resident budget 不是孤立 cache 参数。控制器同时选择：
+所有手动和自动动作共用同一控制器，避免前端、悬浮窗和后台 Agent 同时发起冲突迁移。`abort` 仅用于错误恢复，不是日常抢占策略。
 
-- 每层不同的 expert slots `{K_l}`；
-- prefetch horizon 和 prediction-set 风险；
-- NVMe/RDMA/UMA 带宽上限；
-- decode token rate/duty cycle；
-- 是否升级到 yield/hibernate。
+## 7. Phase-Constrained Elastic Expert Residency
 
-必要条件为：
+Nemotron 的 routed experts 占据主要权重空间，因此 PLLM 把模型拆成必须常驻的稠密部分和可管理的专家对象。运行时导出已经经过 ModelOpt NVFP4/Marlin 转换的对象，并为每个对象保存 layer、expert、shape、dtype、layout、offset、size 和 checksum。
 
-```text
-token_rate * expected(miss_bytes + false_prefetch_bytes)
-    <= min(storage bandwidth, staging bandwidth, foreground UMA slack)
-```
+### 7.1 正确性约束
 
-不满足时继续 paging 没有意义，系统必须降速或休眠。
+PLLM 始终执行 router 选出的真实 Top-k 专家。预测集合只决定提前搬运和保留的对象；预测 miss 会触发正确专家加载，而不会改写路由、降低 Top-k 或使用近似专家。
 
-### 4.3 HiberCache 与 Token Transaction
+### 7.2 阶段约束
 
-深度休眠需要保存的不是第二份 75GiB 权重，而是正在演化的 live state：
+- prefill 强制完整驻留，避免大量并行 token 造成换页风暴。
+- decode 使用 request-local 历史窗口形成下一窗口候选集合。
+- 规划器逐层检查容量、held-out miss、剩余生成 horizon、转换成本和 TPOT 上限。
+- 证据不足或预算不可行时维持完整驻留；持续 miss debt 越界时退出 paging，转入 yield 或 hibernate。
 
-- prompt 与已生成 token IDs；
-- Attention KV block 与未满 tail；
-- NemotronH Mamba conv/temporal state；
-- sampler RNG、grammar state；
-- scheduler block table；
-- 带单调序号的输出 ledger 和 client commit boundary。
+### 7.3 数据面
 
-Attention KV append-only，适合异步 shadow flush；Mamba state 每 token 整体更新，在复制当前约 162MiB state 与从旧 checkpoint replay suffix 间选择。只有 object checksum、manifest 和 epoch commit durable 后才允许释放 model allocations。
+物理数据面在 vLLM 进程内维护 expert slot、映射表和缓存对象。控制面通过本地 Unix socket 查询状态并发送 `resize`、`prefetch`、`evict` 等命令。自动物理 resize 默认关闭，避免未经目标硬件验收的重建动作进入常规运行。
 
-现有 vLLM `OffloadingConnector + TieringOffloadingSpec` 是数据承载基础，但并不自动提供 live request transaction。真实 Nemotron 的 Mamba serializer、block-table restore 和 RNG continuity 仍需实现和验证。
+## 8. HiberCache 与恢复
 
-### 4.4 SparkLoad 与分层数据路径
+HiberCache 基于 vLLM `OffloadingConnector + TieringOffloadingSpec`，使用可配置 host staging 和本地文件层保存活跃请求拥有的 KV block。PLLM 的版本守卫补丁为深度 `mode=keep` 提供连接器排空和状态重置，并在不满足补丁条件时回退到 token 重算。
 
-DGX Spark CPU/GPU 共用 128GB UMA，因此 CPU offload 不能作为容量层。PLLM 的真实层级是：
+恢复数据分为三类：
 
-```text
-expert/model slots in UMA
-        <-> local NVMe canonical shards
-        <-> remote host memory over ConnectX-7
-```
+1. **不可变权重**：不重复写出 checkpoint；从共享模型目录、expert cache 或远端 warm source 恢复。
+2. **可重算缓存**：已有 KV block 直接复用，缺失部分由 token 重算。
+3. **不可随意重算的 live state**：事务式 carrier 按固定大小分块，manifest 最后提交，避免半完成状态被当成有效快照。
 
-Spark 不支持 GPUDirect RDMA。PLLM 因此实现两条语义不同的 host-staged 路径：
+目前 live-state carrier 已具备 SSD/RDMA 事务语义，但模型内部 Mamba、KV block table、sampler 和 RNG serializer 仍需逐项接入。因此系统会明确显示能力边界，不把“carrier 可用”展示成“exact resume 已完成”。
 
-- durable object store：`CX-7 -> registered host buffer -> local SSD atomic cache -> checked Python buffer -> CUDA/UMA slot`，提供 checksum、manifest 和落盘语义；
-- volatile remote pool：71 预注册 64GiB host MR，75 以持久 RC QP 执行 one-sided PUT/GET，71 CPU 与文件系统不进入数据热路径。
+## 9. SparkLoad 与多级存储
 
-在线 client 将父进程共享 mmap 直接注册为本地 MR，RDMA READ 后子进程只返回 descriptor；Python 以 `memoryview` 解析 package，不再经过 payload pipe 或本地文件。终点仍是 host pages，随后需要 H2D/UMA slot copy，因此不是 NIC 直达 GPU 或 GPUDirect。两条路径均受前台感知 I/O governor 限制。
+SparkLoad 避免为深度休眠再次写出大型不可变权重：
 
-Level 2 恢复直接读取共享模型 checkpoint，不在每次休眠时写出第二份 75GiB 权重。`fastsafetensors`、multithread safetensors 和未来 expert-object loader 的 transform 时间与 I/O 时间分别记录。
+- 本地恢复直接复用只读 safetensors 模型目录。
+- fastsafetensors 负责加载路径。
+- 独显环境可选择 host backup 或 GDS 能力。
+- DGX Spark/GB10 选择统一内存兼容路径，不把 CPU offload 视为额外容量。
+- 专家对象可使用连续 pack 减少大量小文件的元数据与随机 I/O。
 
-### 4.5 产品界面与规划视图
+RDMA bridge 提供带 token 与路径守卫的对象 store，以及持久 RC QP、预注册共享 host MR 的 volatile pool。Python 侧通过 `memoryview` 消费共享区域，避免 payload pipe；GB10 上终点仍是 host memory，后续 slot refill 需要单独的数据搬运。
 
-现有 PySide6 置顶悬浮窗显示当前前台应用、系统状态、PLLM 模式、释放 GiB、GPU/UMA/功耗和一键 release/wake。Vue 3 控制中心由 Flask 静态托管，不使用 Node.js。迭代 3 已加入 recommendation-only 的 Expert Residency 规划视图：
+## 10. DGX Spark 平台适配
 
-- Full/Elastic/Hibernated 状态时间线；
-- 40 层 slots、投影 resident/reclaim bytes、miss traffic 和 token-rate cap；
-- 空闲、创作与紧急三组资源包络交互；
-- NVMe/RDMA/UMA 流量及 I/O governor；
-- 决策原因、资源包络与 phase-boundary 告警；
-- `CONTROL PLANE ONLY`、`NOT EXECUTABLE` 和 evidence source 标识；
-- 实验矩阵和原始 JSON/CSV 下载。
+PLLM 对 DGX Spark 的优势利用集中在四个方面：
 
-其中每层柱状图表示 planner 的 slot 投影，不是实际 cache heatmap。真实 `predicted set/actual Top-22/hit/miss` 只有接入 route tracer 和 slot data plane 后才允许显示为 live data。
+- **统一内存感知**：同时约束系统可用内存、模型驻留和前台显存需求，避免把同一物理内存重复计算。
+- **全栈 NVIDIA 软件**：使用 NVML、vLLM、ModelOpt NVFP4、Marlin、CUDA 能力探测和 NVIDIA Nemotron 开源模型。
+- **ConnectX 数据路径**：在能力允许时使用 RDMA 远端 warm source；在 GB10 上明确采用 host-staged fallback。
+- **桌面交互闭环**：将 GNOME 前台事件与 GPU、编码器和内存信号组合，使 DGX Spark 不只是推理服务器，也能作为共享的个人 AI 工作站。
 
-## 5. 创新点与现有工作的差异
+能力探测结果通过 `/api/v1/capabilities` 暴露。平台不具备的 GDS、GDR 或 loader 能力不会仅凭配置被标记为可用。
 
-“预测 expert 并预取”本身不是创新：MoE-Infinity、ProMoE、ExpertFlow、Fate 和 Pre-Attention Prediction 已经覆盖 activation trace、跨层预测和 proactive cache；SpecMD、FlashMoE 和 ActiveEvict 已覆盖淘汰、SSD 与动态 budget。
+## 11. 多智能体与模型融合
 
-PLLM 的可辩护创新是三者的联合问题：
+项目包含 Reviewer Agent 与 Author Agent：
 
-### 5.1 外部前台 SLO 驱动的可收缩 residency
+- Reviewer 负责新颖性、事实、证据边界、平台适配和可证伪性检查。
+- Author 对每条意见选择接受、部分接受、证据反驳、降级主张或删除，并输出完整修订稿。
 
-已有 offloading 工作大多在固定 GPU budget 下优化模型 TPOT。PLLM 的 budget 由不可控前台实时改变，并同时限制物理容量、NVMe/RDMA、UMA、算力和功耗。系统研究的是是否存在 `full resident` 与 `full hibernate` 之间的 Pareto 区间。
+两者使用隔离的 system prompt，编排器至少运行三轮，逐轮保存 review、rebuttal 和 manuscript snapshot，默认不覆盖原文。接口兼容 OpenAI Chat Completions，因此可以连接本地 NVIDIA Nemotron/vLLM，也可以连接阶跃星辰等兼容模型服务。API key 只从环境变量读取，不写入配置或仓库。
 
-### 5.2 风险校准但严格精确的专家预取
+该智能体流程用于文档与方案质量控制，不进入实时资源决策关键路径；前台资源动作仍由可审计的本地确定性 guard 执行。
 
-PLLM 不以 router prediction 替代真实 routing。Prediction set 只决定提前搬什么，actual Top-22 决定必须执行什么。误预测成本被转化为可测的 stall/I/O，而不是隐藏的模型质量变化。风险校准进一步把“集合多大”与前台带宽预算连接起来。
+## 12. 前后端与接口
 
-### 5.3 Elastic-to-Hibernate phase boundary
+### 12.1 Web 控制中心
 
-专家换页不是万能模式。PLLM runtime 记录 actual remote GET、package parse、H2D 与 mapping wall，并按 resize 时下发的 per-token budget 累积 miss debt；超过预算后，统一仲裁器执行 yield 或 hibernate，而不是继续 paging。当前 debt 代码与回归已完成，GPU fault-injection 仍待验收。
+前端使用 Vue 3 静态构建文件，由 Flask 直接托管，不依赖 Node.js 构建链。页面包含总览、状态机、资源传感器、策略编辑、专家驻留、数据面能力、事件和请求 replay。
 
-上述贡献目前属于研究设计。只有 expert slot data plane、真实 traces、前台实验和事务正确性全部成立，才足以形成强系统论文；当前不能把 A+B+C 的架构图当作已证明创新。
+### 12.2 桌面悬浮窗
 
-## 6. DGX Spark 适配价值
+PySide6 悬浮窗提供当前状态、资源压力、自动/手动模式和常用动作；GNOME Shell 扩展把活跃窗口元数据写入控制面可读取的位置。
 
-- 128GB UMA 允许 120B NVFP4 模型运行，也使 CPU offload 失去物理容量意义。
-- 273GB/s 共享带宽同时承载 GPU compute、CPU、NVMe/NIC staging 和前台图形，需要显式 governor。
-- 两个 copy engines 为预取重叠提供条件，但不能消除 LPDDR 和存储能耗。
-- ConnectX-7 提供远端容量源，但无 GDR，必须 host-stage。
-- 140W GB10 功耗包络使 SSD/RDMA expert traffic 的能耗成为一等指标。
-- NemotronH 同时包含 Mamba、Attention、LatentMoE 和 NVFP4，是检验混合状态与 fine-grained expert residency 的高难度对象。
+### 12.3 OpenAI 兼容代理
 
-## 7. 当前实现与证据边界
+客户端统一连接 PLLM `/v1/chat/completions`。控制器在请求进入 prefill 前检查服务和专家驻留条件；暂停时创建 replay 记录并返回可追踪 ID；恢复后可通过 replay API 重新提交。
 
-### 已在真实模型/硬件上验证
+### 12.4 管理 API
 
-- 完整回归 `108 passed`，CMake、无 CUDA server build 和 shell syntax 通过；
-- 完整导出 20,480 个 Marlin runtime experts、约 60GiB，跨 40 层抽样 checksum 全部通过；
-- 128-slot ModelOpt NVFP4/Marlin EER 启动、actual Top-22 blocking load 和真实生成；
-- vLLM Level 1/2 与 PLLM API hibernate/wake；Level 2 在 0.131--0.185s 回收约 43--44GiB；
-- 恢复后真实 OpenAI proxy 请求 HTTP 200，但本地恢复约 39--42s，冷槽请求约 33s；
-- 60GiB 前台 CUDA allocation 从模型常驻 OOM 变为休眠后成功；
-- 20MiB RC RDMA PUT/GET integrity、token/path guard、Python store 与 15MiB live-state carrier；
-- 75→71 的 volatile pool 已容纳完整 20,480-object、63,435,912,912B image；direct shared host-MR 的 1/8/22/32-object steady p95 为 0.477/2.863/42.710/43.897ms，吞吐 55.5/72.4/27.3/29.0Gb/s；
-- Blender 5.2 OptiX 场景、GNOME focus PID 与 PLLM workload input 链路；当前只有预览，没有 QoS 对照；
-- 实时 NVML/EER API、SSE、Vue 桌面/移动界面与 PySide6 悬浮窗。
-- full-resident vLLM 完成 MQA/NQA/TQA 各 50 条：F1 0.3600、总吞吐
-  6,734.30 tok/s；EER-256 首条 MQA 在 499s 内未完成，延迟下界 >226.09x，
-  累计换入 358.43GiB，构成真实 paging-collapse 反例。
+REST API 提供状态、能力、服务发现、策略更新、手动动作、专家计划和数据面操作；SSE 端点提供实时遥测。默认仅监听回环地址。
 
-### 已实现但只具部分证据
+## 13. 安全设计
 
-- past-to-next route predictor 与逐层 horizon planner 已通过 synthetic trace，不能代表真实 Nemotron 路由局部性；
-- Level 0 同一 HTTP stream 可以冻结且不重连，但跨独立请求 bitwise determinism 失败，不能声称 exact token resume；
-- live-state carrier 的 SSD/RDMA transaction 已验证，Mamba/KV/RNG serializer 尚未接入；
-- 128 slots 的 exact fused Top-22 需要 `max_num_batched_tokens<=5`，路径正确但性能不可接受；
-- full 512 experts + Sleep Mode 在 Marlin repack 阶段启动 OOM；Level 2
-  恢复 EER 后 slots 为冷状态，`data_plane_ready` 尚不能代表 warm-set ready；
-- shrink retained-row copy、destructive expansion 与 sampled state guard 已实现；真实 40 层 resize、H2D 和 kernel stall 尚未测量。
+- API 与 vLLM 默认绑定 `127.0.0.1`。
+- 不提供终止未知进程的权限。
+- 训练相关进程模式默认排除。
+- RDMA 服务使用 token、root directory 和对象路径校验。
+- 模型目录只读复用，缓存写入独立目录。
+- API key 和 RDMA token 不进入版本控制。
+- manifest 使用最后提交语义；未完成快照不会被当成有效恢复点。
+- 自动专家物理重建默认关闭。
 
-### 仍待完成
+## 14. 项目完整性
 
-- 真实 decode route tracer、逐层 planner calibration 与 EER baseline matrix；
-- shared host-MR 后的 H2D/UMA slot 与同 profile NVMe baseline；
-- DGX Spark ConnectX-7/UMA 测试；
-- Blender、游戏、NVENC 的真实 throughput/jank/energy；
-- NemotronH Mamba/KV/RNG restore 与 greedy token equality。
+仓库提供以下可独立演示和部署的组成部分：
 
-MR staging copy、纯 verbs phase 与调用者 wall time 继续分开报告。跨机结果来自优化前协议 v1；selective-signaling/inline-header/read-depth-16 的 v2 只完成 124MB 本机 RoCE smoke test，不以本机 94.0/79.1Gb/s 替代跨机复测。详细结果见 `docs/实验报告.md`。
+- 使用 mock vLLM 的无 GPU 控制面演示；
+- 真实 NVIDIA Nemotron/vLLM 启动脚本；
+- Web 控制中心、桌面悬浮窗和 GNOME 扩展；
+- 用户级 systemd 服务；
+- 本地 NVMe 与可选 RDMA 数据路径；
+- OpenAI 兼容推理代理；
+- 双智能体文档审阅工具；
+- 单元测试、集成配置、部署指南、演示脚本和黑客松开发记录。
 
-### LongBench QA 对照结论
+快速启动、完整配置、端口和常见故障处理见仓库根目录 `README.md`。
 
-完整 150 条质量结果只属于 full-resident baseline。真正具备快速释放能力的
-PLLM 配置没有完成首条 EER-256 样本，因此其 F1 是 N/A，而不是 0。当前证据
-支持“0.210s 回收 73,718MiB”，不支持“开启 PLLM 后保持质量与吞吐”。共享
-模型占 74.846GiB，EER runtime experts 额外占 59.079GiB，部署合计
-133.926GiB。仅启用 monitor/HiberCache 的全驻留控制组因另一用户作业占用
-77,296MiB 而未运行，不能用 baseline 推测其开销；详细逐样本结果见
-`docs/LongBench-QA开关PLLM实验.md`。
+## 15. 演示设计
 
-## 8. 实验计划
+推荐演示遵循一条清晰主线：
 
-迭代 2 的 `results/expert_residency_simulation.json` 仍只验证 control-plane accounting：synthetic calibration coverage 1.0、set size 263，在 domain shift 上 coverage 为 0，不能升级为真实 predictor 结论。当前真实 runtime 已报告 40 层、128 physical slots 和 `data_plane_ready=true`；前端因此可以展示 LIVE 数据面，但 planner 的 256-slot 建议必须与实际 128 slots 分栏。自动 resize 保持默认关闭。
+1. 在控制中心确认后台推理正在运行。
+2. 发起一个流式请求，展示 OpenAI 兼容接入。
+3. 切换到 Blender 并开始渲染，展示前台识别和资源压力变化。
+4. 展示状态机从 active 进入 yielding 或 hibernated，以及显存/内存包络的同步变化。
+5. 停止前台压力，展示 restoring 与推理服务恢复。
+6. 打开能力页面，说明 DGX Spark UMA、NVIDIA 模型/SDK 和 RDMA fallback 的适配逻辑。
+7. 简要展示双智能体如何用本地 Nemotron 或阶跃星辰兼容接口审阅项目文档。
 
-### 8.1 Expert trace 与预测
+详细操作见 `docs/Blender手动演示操作指南.md` 与 `docs/演示视频脚本.md`。
 
-- workload：code、math、chat、RAG、长上下文和 domain shift；
-- 记录每层 actual Top-22、router scores、latent input、token phase；
-- 比较 LRU、LFU、Least-Stale、ProMoE-style predictor、fixed top-n 和 calibrated set；
-- 指标：byte hit、set size、false bytes、blocking miss、coverage 和 drift recovery。
+## 16. 后续工作
 
-### 8.2 容量与前台 QoS
-
-- resident slots：full、256、128、64、32 per layer；
-- 前台：Blender、graphics trace、NVENC、NVMe media workload；
-- 指标：`MemAvailable`、admission success、throughput/jank、功耗、PSI、I/O 和后台 TPOT；
-- 与无后台模型前台基线比较，目标为 90%以上，但必须报告实际置信区间。
-
-### 8.3 Phase boundary
-
-比较始终 paging、始终 yield、始终 hibernate 和 PLLM 自适应策略。扫描 token rate、cache budget、SSD/RDMA 带宽和前台持续时间，验证是否存在稳定 elastic Pareto 区间，以及控制器是否在 paging collapse 前退出。
-
-### 8.4 Transaction 与恢复
-
-在每个 token boundary 注入 pause；对 Attention tail、Mamba state、RNG、manifest 和 block table 做 fault injection。Greedy 输出必须逐 token等于 uninterrupted baseline；随机采样必须恢复 RNG；跨连接 only-once 只对支持 token ACK 的 PLLM 客户端声明。
-
-### 8.5 否证条件
-
-以下结果必须如实报告：
-
-- 95% byte hit 需要接近完整 64GiB expert cache；
-- SSD/RDMA 流量使前台性能低于 baseline 90%；
-- expert slot remap 或 NVFP4 transform 抵消容量收益；
-- calibrated set 在 prompt shift 下系统性失效；
-- 双源因 UMA contention 慢于最佳单源；
-- Mamba/stream transaction 无法保持 token equality。
-
-## 9. 双智能体审稿机制
-
-仓库新增两个职责隔离的研究智能体：
-
-- Reviewer Agent：检查新颖性、已有工作覆盖、证据、硬件事实和可证伪性；
-- Rebuttal/Revision Agent：逐条选择接受、部分接受、证据反驳、降级为假设或删除主张，并输出完整修订稿。
-
-编排器默认运行四轮，每轮保存 review、rebuttal 和 manuscript snapshot，不默认覆盖论文。项目三轮工程迭代各自又完成至少三轮 Reviewer/Rebuttal 往返，记录位于 `docs/reviews/iteration-1`、`iteration-2` 和 `iteration-3`。本地 GPU 空闲后可用任意 OpenAI-compatible/vLLM endpoint 重跑自动编排器。
-
-## 10. 比赛提交材料
-
-- `README.md`：安装、运行、Demo 和证据边界；
-- `paper/HiberFlow-ACM六页稿.md`：最新六页论文设计稿；
-- `docs/PLLM项目报告.md`：本报告；
-- `docs/research/近一年相关工作矩阵.md`：相关工作与差异；
-- `docs/实验报告.md`：实验协议与真实数据；
-- `docs/部署说明.md`：conda、vLLM、GNOME 和 systemd；
-- `docs/演示视频脚本.md`：评委演示流程；
-- `docs/reviews/四轮审稿迭代记录.md`：审稿、答辩和修改轨迹；
-- `agents/`、`scripts/run_peer_review.py`：双智能体复现实验。
-
-## 11. 结论
-
-PLLM 最新方案不再把资源让渡等同于“暂停并重载整模型”。它利用 Nemotron routed experts 占权重主体的结构，在保持 Top-22 完全不变的前提下提供可收缩 residency；用前台资源包络同时约束 cache、I/O、decode duty cycle 和 hibernation；当 paging 不可行时，再以事务方式保护小型 live state 并丢弃大权重。
-
-这比单独的 expert prediction、Sleep Mode 或 SSD loader 更接近一个完整研究问题。数据面已经在 RTX PRO 上运行并证明快速释放与前台显存 admission，但也暴露出 fused Top-22 batch 上界、约 40 秒恢复和跨请求非确定性。Mamba transaction、真实路由预测、前台吞吐和 DGX Spark 实验仍未完成；创新性最终由这些问题能否形成新算法并取得 Pareto 改善决定。
-
-LongBench 的 paging-collapse 反例进一步表明，仅增加 SSD/RDMA 带宽不能解决
-问题：当 68.96% byte hit 导致单请求换入 358.43GiB 时，系统必须在在线
-miss-debt 越界后退出 elastic mode。下一版的研究重点因此是可证伪的在线
-phase boundary 与 layer-pipelined expert execution，而不是继续扩大静态 cache。
+- 接入 NemotronH Mamba/KV/RNG 的模型级 serializer 与 restore。
+- 完成 RDMA shared host-MR 到 GPU/UMA expert slot 的流水化 refill。
+- 在 DGX Spark 上校准统一内存、带宽、功耗和前台 QoS 包络。
+- 扩展 GNOME 之外的桌面环境输入。
+- 为跨连接 token exactly-once 增加客户端 ACK 协议。
+- 在更多 MoE 模型和前台应用上验证通用性。
 
 ## 参考资料
 
-- [MoE-Infinity](https://arxiv.org/abs/2401.14361)
-- [ProMoE](https://arxiv.org/abs/2410.22134)
-- [ExpertFlow](https://arxiv.org/abs/2410.17954)
-- [Fate](https://arxiv.org/abs/2502.12224)
-- [Pre-Attention Expert Prediction](https://arxiv.org/abs/2511.10676)
-- [SpecMD](https://machinelearning.apple.com/research/specmd-expert-prefetching)
-- [ActiveEvict](https://openreview.net/pdf?id=UAMZ4tRFn6)
-- [FlashMoE](https://arxiv.org/abs/2601.17063)
-- [OD-MoE](https://arxiv.org/abs/2512.03927)
-- [SSD MoE Offloading Energy Analysis](https://arxiv.org/abs/2508.06978)
 - [NVIDIA DGX Spark Hardware](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)
 - [NVIDIA DGX Spark CUDA Porting Guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html)
 - [vLLM Sleep Mode](https://docs.vllm.ai/en/latest/features/sleep_mode/)
+- [vLLM KV Offloading Usage Guide](https://docs.vllm.ai/en/latest/features/kv_offloading_usage/)
+- [MoE-Infinity](https://arxiv.org/abs/2401.14361)
+- [ProMoE](https://arxiv.org/abs/2410.22134)
+- [ExpertFlow](https://arxiv.org/abs/2410.17954)

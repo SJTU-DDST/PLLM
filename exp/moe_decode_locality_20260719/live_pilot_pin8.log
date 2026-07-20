@@ -1,6 +1,0 @@
-warmup=1/2
-warmup=2/2
-round=1/1 arm=resident_baseline
-round=1/1 arm=pause_only
-round=1/1 arm=pause_evict_380
-round=1/1 arm=pause_evict_382

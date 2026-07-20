@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument(
         "--manuscript",
         type=Path,
-        default=ROOT / "paper" / "HiberFlow-ACM四页稿.md",
+        default=ROOT / "docs" / "PLLM项目报告.md",
     )
     parser.add_argument("--context", action="append", type=Path, default=[])
     parser.add_argument("--rounds", type=int, default=4)
@@ -35,8 +35,7 @@ def main() -> None:
     args = parser.parse_args()
 
     context_paths = args.context or [
-        ROOT / "docs" / "research" / "近一年相关工作矩阵.md",
-        ROOT / "docs" / "实验报告.md",
+        ROOT / "docs" / "主流推理框架暂停恢复调研.md",
     ]
     client = OpenAICompatibleClient.from_environment()
     reviewer = ReviewerAgent(

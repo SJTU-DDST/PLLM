@@ -1,36 +1,35 @@
+# Python bytecode and package metadata
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 build/
 dist/
+
+# Local environments and editors
+.venv/
 .idea/
 .vscode/
-.venv/
+
+# Native build products and runtime logs
+/rdma_bridge/build/
+*.log
 cufile.log
-results/*.json
-!results/rdma_memory_pool_live_put_sharded.json
-!results/rdma_memory_pool_live_get_sharded.json
-results/*.csv
-results/*.png
-results/eer-memory-*.tsv
-!results/.gitkeep
-!results/mock_integration.json
-!results/rdma_bench.json
-!results/rdma_store_live.json
-!results/nemotron_eer128_summary.json
-!results/nemotron_eer128_level1.json
-!results/nemotron_eer128_level2.json
-!results/nemotron_eer128_continuity_level0.json
-!results/nemotron_eer128_determinism_control.json
-!results/nemotron_foreground_admission.json
-!results/nemotron_calibration.json
-!results/ui-demo.png
-!results/pllm-dashboard-v2.png
-!results/pllm-dashboard-mobile-v2.png
-!results/pllm-overlay-v2.png
-!results/pllm-dashboard-live-desktop.png
-!results/pllm-dashboard-live-mobile.png
-!results/README.md
+
+# Generated results and local datasets
+/results/*
+!/results/.gitkeep
+/exp/
+/test_data/
+
+# Manuscript, presentation-draft, and review workspaces
+/paper/
+/pre/
+/pre.md
+/pref.md
+/docs/reviews/
