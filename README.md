@@ -1,23 +1,22 @@
 # PLLM HiberFlow
 
-PLLM HiberFlow 是面向 DGX Spark 与 NVIDIA Linux 桌面工作站的前台感知推理运行时。它让常驻的 vLLM 服务在 Blender、游戏、视频编解码或系统内存压力出现时主动让出资源，并在压力消退后恢复服务，从而减少“手动停模型—启动前台应用—重新加载模型”的操作成本。
+PLLM HiberFlow 是面向 DGX Spark 的负载感知大模型推理框架，其核心是精确专家驻留、分级休眠与资源感知调度算法。它让常驻的 vLLM 服务在渲染、游戏、视频编解码、图片生成等需要 GPU 资源的场景时主动让出资源，并在压力消退后恢复服务，从而减少“手动停模型—启动前台应用—重新加载模型”的操作成本。
 
-第一版只管理明确接入的 vLLM 实例，不暂停训练任务、未知 CUDA 进程或未开放 Sleep API 的外部服务。默认模型为 NVIDIA Nemotron 3 Super 120B A12B NVFP4，也可通过环境变量替换为兼容模型。
+默认模型为 NVIDIA Nemotron 3 Super 120B A12B NVFP4，也可通过环境变量替换为兼容模型。
 
 ![PLLM Web 控制中心](docs/assets/pllm-dashboard.png)
 
-## 项目价值
+## 项目亮点
 
 - **前台体验优先**：融合 GNOME 前台窗口、NVML 进程与显存指标、NVENC/NVDEC、功耗、Linux PSI、可用内存和供电状态，每 250 ms 更新一次资源判断。
 - **分级让渡资源**：在完整驻留、弹性专家驻留、Level 0 微暂停和 Level 1/2 深度休眠之间切换，而不是只有“常驻”与“杀进程”两个选择。
-- **模型连续服务**：通过 OpenAI 兼容代理统一接入请求；暂停期间记录可重放请求，恢复后继续由同一控制面处理。
-- **MoE 感知优化**：prefill 保持完整专家集合，decode 才允许基于历史路由窗口规划驻留集合；预测失误时仍加载真实 Top-k 专家，不改变模型路由结果。
-- **多级数据路径**：HiberCache 保存活跃 KV block，权重可从本地 NVMe 重新加载，专家缓存可选择本地或 RDMA 远端存储。
+- **弹性专家驻留算法**：prefill 保持完整专家集合，decode 基于历史路由窗口规划专家驻留集合；预测 miss 时仍加载真实 Top-k 专家，不改变模型路由结果。
+- **多级数据路径**：UMA slots ↔ 本机 NVMe ↔ ConnectX-7 远端存储池，HiberCache 保存活跃 KV block，权重可从本地 NVMe 重新加载，专家缓存可选择本地或 RDMA 远端存储。
 - **可解释与可演示**：Vue 控制中心、PySide6 悬浮窗和 REST/SSE API 同时展示传感器、状态机、策略原因、能力探测和恢复事件。
 
-PLLM 针对 DGX Spark 的统一内存架构做了显式能力分支：不会把 GB10 上的 host-staged RDMA 描述为 GPUDirect RDMA，也不会把 host backup 当成额外的独立显存层。平台不支持的路径会由能力探测降级或关闭。
-
 ## 系统架构
+
+![PLLM 架构图](docs/assets/pllm-架构图.png)
 
 ```text
 GNOME 前台窗口 ─┐
@@ -31,7 +30,9 @@ OpenAI 客户端 ─> :17860 代理 ─> vLLM :8000      ├─> Elastic Expert 
                          └─> PySide6 桌面悬浮窗
 ```
 
-控制状态机为：
+资源弹性卸载状态机为：
+
+![PLLM 资源弹性卸载步骤](docs/assets/pllm-资源弹性卸载步骤.png)
 
 ```text
 ACTIVE <-> ELASTIC_RESIDENT -> YIELDING -> QUIESCING
@@ -45,22 +46,19 @@ ACTIVE <-> ELASTIC_RESIDENT -> YIELDING -> QUIESCING
 - `HIBERNATED`：Level 1 将可恢复权重保留在 host，Level 2 释放权重并从模型目录恢复。
 - `RESTORING`：恢复权重、KV 状态和调度器，然后重新开放代理。
 
-HiberCache 已接入 vLLM `OffloadingConnector + TieringOffloadingSpec`。对于尚未提供独立序列化器的混合状态，系统采用缺失 block 的 token 重算回退；事务式 live-state carrier 已实现，但不等同于已经完成所有 NemotronH Mamba/KV/RNG 状态的精确恢复。
-
 ## 仓库结构
 
 ```text
 pllm/                 核心控制器、监控、策略、代理与数据面
-frontend/             无需 Node.js 构建的 Vue 3 控制中心
-desktop/              PySide6 桌面端与 GNOME Shell 扩展
-agents/               Reviewer / Author 双智能体角色约束
+frontend/             Vue 3 控制中心
+desktop/              PySide6 桌面端悬浮窗与 GNOME Shell 扩展
 scripts/              安装、启动、运维与可选基准工具
 rdma_bridge/          C++ RDMA store 与预注册内存池
 systemd/              用户级服务模板
-tests/                单元测试与 mock 集成配置
+tests/                单元测试与集成配置
 docs/                 部署、演示、调研和赛事开发记录
-results/              本地生成物目录，仅保留占位文件
-vllm_patch/            vLLM 运行时接入补丁
+results/              本地生成物目录
+vllm_patch/           vLLM 运行时接入补丁
 ```
 
 ## 环境要求
@@ -230,7 +228,7 @@ dry_run = false
 
 ## Elastic Expert Residency
 
-首次启用 EER 前，需在 GPU 空闲时导出模型转换后的 Marlin runtime experts：
+首次启用 EER 前，需在 GPU 空闲时导出模型转换后的 runtime experts：
 
 ```bash
 MODEL_PATH=/path/to/model bash scripts/run_vllm_export_experts.sh
@@ -329,39 +327,11 @@ curl -X POST http://127.0.0.1:17860/api/v1/actions \
   -d '{"action":"wake"}'
 ```
 
-## 双智能体文档审阅
-
-`ReviewerAgent` 与 `AuthorAgent` 使用相互隔离的 system prompt：前者检查新颖性、正确性、证据和 DGX Spark 适配性，后者逐条答辩并生成修订稿。编排器兼容本地 NVIDIA Nemotron/vLLM，也兼容阶跃星辰等提供 OpenAI 兼容 Chat Completions 接口的模型服务。
-
-```bash
-# base URL 填写 /v1 之前的部分；不要把真实密钥写入仓库
-export PLLM_REVIEW_BASE_URL='<openai-compatible-base-url>'
-export PLLM_REVIEW_MODEL='<model-id>'
-export PLLM_REVIEW_API_KEY='<api-key>'
-
-python scripts/run_peer_review.py --rounds 4
-```
-
-默认审阅 `docs/PLLM项目报告.md`，以暂停恢复调研作为上下文，输出到已忽略的 `results/peer-review/`。可用 `--manuscript`、重复的 `--context` 和 `--output-dir` 替换输入输出；只有显式传入 `--apply-final` 才会覆盖原文。更多说明见 [`agents/README.md`](agents/README.md)。
-
-## 运维与故障排查
-
-- **提示找不到 vLLM**：激活 `.venv`/conda，或设置 `VLLM_BIN` 与 `PLLM_PYTHON`。
-- **提示模型不可读**：确认 `MODEL_PATH/config.json` 存在且当前用户可读。
-- **控制中心找不到后端**：检查 `default_vllm_urls`、vLLM 端口以及 `/v1/models` 是否可访问。
-- **HiberCache 补丁警告**：重新运行 `python scripts/apply_vllm_hibercache_patch.py`；升级 vLLM 后必须重新检查版本守卫。
-- **GNOME 前台应用为空**：确认扩展已启用，并在安装后重新登录桌面会话。
-- **EER 拒绝启动**：先确认 `runtime-manifest.json` 完整，或正确配置 RDMA warm source。
-- **只观察、不执行策略**：使用 `python -m pllm.daemon --dry-run` 或配置 `dry_run = true`。
-
-运行生成的 JSON、CSV、图表、日志、审稿输出和临时数据统一写入 `results/`、`exp/` 或自定义目录；这些目录不会进入版本控制。模型、缓存、API 密钥和 RDMA token 也不得提交。
-
 ## 文档
 
 - [部署说明](docs/部署说明.md)
 - [Blender 手动演示操作指南](docs/Blender手动演示操作指南.md)
 - [项目报告](docs/PLLM项目报告.md)
-- [暂停恢复技术调研](docs/主流推理框架暂停恢复调研.md)
 - [演示视频脚本](docs/演示视频脚本.md)
 - [DGX Spark 黑客松演示视频](https://alumnisjtuedu-my.sharepoint.com/:v:/g/personal/cong258258_alumni_sjtu_edu_cn/IQDBQ9qmB_bZRankcW0429SGAX88492VVueX_xCZ5JguZv4?e=2ageR8)
 - [DGX Spark 黑客松十日谈](https://alumnisjtuedu-my.sharepoint.com/:w:/g/personal/cong258258_alumni_sjtu_edu_cn/IQAKso6t_M5MRIciYNYE9xo8ATOk_BnoRPakXdcfrgs4Vi4?e=shrDkp)
